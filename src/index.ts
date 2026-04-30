@@ -1,18 +1,22 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
-import { Key, matchesKey, truncateToWidth } from "@mariozechner/pi-tui";
+import { fuzzyFilter, Key, matchesKey, truncateToWidth } from "@mariozechner/pi-tui";
 import { open, type GlimpseWindow } from "glimpseui";
 import {
-  getReviewWindowData,
+  getCurrentBranchPullRequestUrl,
   listOpenPullRequests,
-  loadReviewFileContents,
-  parsePullRequestSpec,
   postCommentReply,
   postLineComment,
+} from "./gh.js";
+import {
+  getReviewWindowData,
+  loadReviewFileContents,
+  parsePullRequestSpec,
   preparePullRequest,
-  type PullRequestRef,
 } from "./pr.js";
 import { composeReviewPrompt } from "./prompt.js";
 import type {
+  PrReviewThread,
+  PullRequestRef,
   PullRequestSummary,
   ReviewCancelPayload,
   ReviewFile,
@@ -32,8 +36,90 @@ function escapeForInlineScript(value: string): string {
   return value.replace(/</g, "\\u003c").replace(/>/g, "\\u003e").replace(/&/g, "\\u0026");
 }
 
-function formatPullRequestOption(pr: PullRequestSummary): string {
-  return `#${pr.number}  ${pr.title}  —  @${pr.author}  (${pr.headRefName} → ${pr.baseRefName})`;
+interface PrPickEntry {
+  pr: PullRequestSummary;
+  haystack: string;
+}
+
+function isPrintableInput(data: string): boolean {
+  if (data.length !== 1) return false;
+  const code = data.charCodeAt(0);
+  return code >= 0x20 && code !== 0x7f;
+}
+
+async function pickPullRequestInteractively(
+  ctx: ExtensionCommandContext,
+  summaries: PullRequestSummary[],
+): Promise<PullRequestSummary | null> {
+  const entries: PrPickEntry[] = summaries.map((pr) => ({
+    pr,
+    haystack: `#${pr.number} ${pr.title} ${pr.author} ${pr.headRefName} ${pr.baseRefName}`,
+  }));
+
+  return ctx.ui.custom<PullRequestSummary | null>((_tui, theme, _kb, done) => {
+    let query = "";
+    let filtered = entries;
+    let selectedIdx = 0;
+
+    const refilter = (): void => {
+      filtered = query.length === 0 ? entries : fuzzyFilter(entries, query, (entry) => entry.haystack);
+      selectedIdx = filtered.length === 0 ? 0 : Math.min(selectedIdx, filtered.length - 1);
+    };
+
+    const move = (delta: number): void => {
+      if (filtered.length === 0) return;
+      selectedIdx = (selectedIdx + delta + filtered.length) % filtered.length;
+    };
+
+    return {
+      render(width: number): string[] {
+        const lines: string[] = [
+          theme.fg("accent", theme.bold(`Select pull request (${summaries.length} open)`)),
+          theme.fg("muted", "Type to filter • ↑↓ navigate • Enter select • Esc cancel"),
+          `${theme.fg("accent", "›")} ${query.length === 0 ? theme.fg("muted", "type to filter…") : query}`,
+          "",
+        ];
+
+        if (filtered.length === 0) {
+          lines.push(theme.fg("muted", "  No matches."));
+          return lines;
+        }
+
+        const innerWidth = Math.max(20, width - 4);
+        filtered.forEach((entry, i) => {
+          const selected = i === selectedIdx;
+          const marker = selected ? theme.fg("accent", "▌ ") : "  ";
+          const label = `#${entry.pr.number}  ${entry.pr.title}`;
+          const truncatedLabel = truncateToWidth(label, innerWidth, "…", true);
+          lines.push(`${marker}${selected ? theme.bold(truncatedLabel) : truncatedLabel}`);
+          const meta = `    @${entry.pr.author}  ${entry.pr.headRefName} → ${entry.pr.baseRefName}`;
+          lines.push(theme.fg("muted", truncateToWidth(meta, Math.max(20, width - 2), "…", true)));
+        });
+        return lines;
+      },
+      handleInput(data: string): void {
+        if (matchesKey(data, Key.escape)) { done(null); return; }
+        if (matchesKey(data, Key.enter)) {
+          done(filtered.length > 0 ? filtered[selectedIdx].pr : null);
+          return;
+        }
+        if (matchesKey(data, Key.up)) { move(-1); return; }
+        if (matchesKey(data, Key.down)) { move(1); return; }
+        if (matchesKey(data, Key.backspace)) {
+          if (query.length > 0) {
+            query = query.slice(0, -1);
+            refilter();
+          }
+          return;
+        }
+        if (isPrintableInput(data)) {
+          query += data;
+          refilter();
+        }
+      },
+      invalidate(): void {},
+    };
+  });
 }
 
 async function resolvePullRequestSpec(
@@ -51,9 +137,18 @@ async function resolvePullRequestSpec(
     return parsed;
   }
 
+  const currentBranchUrl = await getCurrentBranchPullRequestUrl(pi, ctx.cwd);
+  if (currentBranchUrl != null) {
+    const parsed = parsePullRequestSpec(currentBranchUrl);
+    if (parsed != null) {
+      ctx.ui.notify(`Using PR for current branch: #${parsed.number} (${parsed.owner}/${parsed.repo})`, "info");
+      return parsed;
+    }
+  }
+
   let summaries: PullRequestSummary[];
   try {
-    summaries = await listOpenPullRequests(pi, ctx.cwd);
+    summaries = await listOpenPullRequests(pi, ctx.cwd, 10);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     ctx.ui.notify(message, "error");
@@ -65,12 +160,8 @@ async function resolvePullRequestSpec(
     return null;
   }
 
-  const labels = summaries.map(formatPullRequestOption);
-  const choice = await ctx.ui.select("Select a pull request to review", labels);
-  if (choice == null) return null;
-  const index = labels.indexOf(choice);
-  if (index < 0) return null;
-  const selected = summaries[index];
+  const selected = await pickPullRequestInteractively(ctx, summaries);
+  if (selected == null) return null;
   const parsed = parsePullRequestSpec(selected.url);
   if (parsed == null) {
     ctx.ui.notify(`Could not parse PR url: ${selected.url}`, "error");
@@ -167,15 +258,19 @@ export default function (pi: ExtensionAPI) {
     const ref = await resolvePullRequestSpec(pi, ctx, args);
     if (ref == null) return;
 
-    ctx.ui.notify(`Fetching PR #${ref.number} from ${ref.owner}/${ref.repo}...`, "info");
+    ctx.ui.notify(`Loading PR #${ref.number} from ${ref.owner}/${ref.repo}...`, "info");
 
     let prepared;
     try {
-      prepared = await preparePullRequest(pi, ref);
+      prepared = await preparePullRequest(pi, ref, ctx.cwd);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       ctx.ui.notify(`Failed to prepare PR: ${message}`, "error");
       return;
+    }
+
+    if (prepared.reusedLocalCheckout) {
+      ctx.ui.notify("Using current directory checkout (no clone needed).", "info");
     }
 
     const data = await getReviewWindowData(pi, prepared);
@@ -195,11 +290,21 @@ export default function (pi: ExtensionAPI) {
     const waitingUI = showWaitingUI(ctx);
     const fileMap = new Map(data.files.map((file) => [file.id, file]));
     const contentCache = new Map<string, Promise<ReviewFileContents>>();
+    const prRef: PullRequestRef = {
+      owner: data.pr.baseOwner,
+      repo: data.pr.baseRepo,
+      number: data.pr.number,
+    };
 
     const sendWindowMessage = (message: ReviewHostMessage): void => {
       if (activeWindow !== window) return;
       const payload = escapeForInlineScript(JSON.stringify(message));
       window.send(`window.__reviewReceive(${payload});`);
+    };
+
+    const sendPostError = (clientId: string, error: unknown): void => {
+      const text = error instanceof Error ? error.message : String(error);
+      sendWindowMessage({ type: "post-error", clientId, message: text });
     };
 
     const loadContents = (file: ReviewFile, scope: ReviewRequestFilePayload["scope"]): Promise<ReviewFileContents> => {
@@ -210,6 +315,97 @@ export default function (pi: ExtensionAPI) {
       const pending = loadReviewFileContents(pi, data, file, scope);
       contentCache.set(cacheKey, pending);
       return pending;
+    };
+
+    const findThreadOwner = (threadId: number): { file: ReviewFile | null; thread: PrReviewThread | null } => {
+      for (const file of data.files) {
+        const thread = file.threads.find((t) => t.id === threadId);
+        if (thread != null) return { file, thread };
+      }
+      return { file: null, thread: data.orphanThreads.find((t) => t.id === threadId) ?? null };
+    };
+
+    const handleRequestFile = async (message: ReviewRequestFilePayload): Promise<void> => {
+      const file = fileMap.get(message.fileId);
+      if (file == null) {
+        sendWindowMessage({
+          type: "file-error",
+          requestId: message.requestId,
+          fileId: message.fileId,
+          scope: message.scope,
+          message: "Unknown file requested.",
+        });
+        return;
+      }
+
+      try {
+        const contents = await loadContents(file, message.scope);
+        sendWindowMessage({
+          type: "file-data",
+          requestId: message.requestId,
+          fileId: message.fileId,
+          scope: message.scope,
+          originalContent: contents.originalContent,
+          modifiedContent: contents.modifiedContent,
+        });
+      } catch (error) {
+        const messageText = error instanceof Error ? error.message : String(error);
+        sendWindowMessage({
+          type: "file-error",
+          requestId: message.requestId,
+          fileId: message.fileId,
+          scope: message.scope,
+          message: messageText,
+        });
+      }
+    };
+
+    const handlePostComment = async (message: ReviewPostCommentPayload): Promise<void> => {
+      const file = fileMap.get(message.fileId);
+      if (file == null) {
+        sendWindowMessage({ type: "post-error", clientId: message.clientId, message: "Unknown file." });
+        return;
+      }
+      const path = message.side === "head"
+        ? file.prDiff?.newPath ?? file.path
+        : file.prDiff?.oldPath ?? file.path;
+      if (path == null) {
+        sendWindowMessage({ type: "post-error", clientId: message.clientId, message: "No path available for this side." });
+        return;
+      }
+      try {
+        const thread = await postLineComment(pi, prRef, {
+          path,
+          side: message.side,
+          line: message.line,
+          body: message.body,
+          commitSha: data.pr.headRefOid,
+        });
+        file.threads.push(thread);
+        sendWindowMessage({ type: "thread-updated", clientId: message.clientId, fileId: file.id, thread });
+      } catch (error) {
+        sendPostError(message.clientId, error);
+      }
+    };
+
+    const handlePostReply = async (message: ReviewPostReplyPayload): Promise<void> => {
+      const { file, thread } = findThreadOwner(message.threadId);
+      if (thread == null) {
+        sendWindowMessage({ type: "post-error", clientId: message.clientId, message: "Thread not found." });
+        return;
+      }
+      try {
+        const comment = await postCommentReply(pi, prRef, message.threadId, message.body);
+        thread.comments.push(comment);
+        sendWindowMessage({
+          type: "thread-updated",
+          clientId: message.clientId,
+          fileId: file?.id ?? message.fileId,
+          thread,
+        });
+      } catch (error) {
+        sendPostError(message.clientId, error);
+      }
     };
 
     ctx.ui.notify(`Opened review window for PR #${data.pr.number}.`, "info");
@@ -232,109 +428,6 @@ export default function (pi: ExtensionAPI) {
           settled = true;
           cleanup();
           resolve(value);
-        };
-
-        const handleRequestFile = async (message: ReviewRequestFilePayload): Promise<void> => {
-          const file = fileMap.get(message.fileId);
-          if (file == null) {
-            sendWindowMessage({
-              type: "file-error",
-              requestId: message.requestId,
-              fileId: message.fileId,
-              scope: message.scope,
-              message: "Unknown file requested.",
-            });
-            return;
-          }
-
-          try {
-            const contents = await loadContents(file, message.scope);
-            sendWindowMessage({
-              type: "file-data",
-              requestId: message.requestId,
-              fileId: message.fileId,
-              scope: message.scope,
-              originalContent: contents.originalContent,
-              modifiedContent: contents.modifiedContent,
-            });
-          } catch (error) {
-            const messageText = error instanceof Error ? error.message : String(error);
-            sendWindowMessage({
-              type: "file-error",
-              requestId: message.requestId,
-              fileId: message.fileId,
-              scope: message.scope,
-              message: messageText,
-            });
-          }
-        };
-
-        const prRef: PullRequestRef = {
-          owner: data.pr.baseOwner,
-          repo: data.pr.baseRepo,
-          number: data.pr.number,
-        };
-
-        const sendPostError = (clientId: string, error: unknown): void => {
-          const text = error instanceof Error ? error.message : String(error);
-          sendWindowMessage({ type: "post-error", clientId, message: text });
-        };
-
-        const handlePostComment = async (message: ReviewPostCommentPayload): Promise<void> => {
-          const file = data.files.find((entry) => entry.id === message.fileId);
-          if (file == null) {
-            sendWindowMessage({ type: "post-error", clientId: message.clientId, message: "Unknown file." });
-            return;
-          }
-          const path = message.side === "head"
-            ? file.prDiff?.newPath ?? file.path
-            : file.prDiff?.oldPath ?? file.path;
-          if (path == null) {
-            sendWindowMessage({ type: "post-error", clientId: message.clientId, message: "No path available for this side." });
-            return;
-          }
-          try {
-            const thread = await postLineComment(pi, prRef, {
-              path,
-              side: message.side,
-              line: message.line,
-              body: message.body,
-              commitSha: data.pr.headRefOid,
-            });
-            file.threads.push(thread);
-            sendWindowMessage({ type: "thread-updated", clientId: message.clientId, fileId: file.id, thread });
-          } catch (error) {
-            sendPostError(message.clientId, error);
-          }
-        };
-
-        const findThreadOwner = (threadId: number): { file: ReviewFile | null; thread: typeof data.files[number]["threads"][number] | null } => {
-          for (const file of data.files) {
-            const thread = file.threads.find((t) => t.id === threadId);
-            if (thread != null) return { file, thread };
-          }
-          const orphan = data.orphanThreads.find((t) => t.id === threadId) ?? null;
-          return { file: null, thread: orphan };
-        };
-
-        const handlePostReply = async (message: ReviewPostReplyPayload): Promise<void> => {
-          const { file, thread } = findThreadOwner(message.threadId);
-          if (thread == null) {
-            sendWindowMessage({ type: "post-error", clientId: message.clientId, message: "Thread not found." });
-            return;
-          }
-          try {
-            const comment = await postCommentReply(pi, prRef, message.threadId, message.body);
-            thread.comments.push(comment);
-            sendWindowMessage({
-              type: "thread-updated",
-              clientId: message.clientId,
-              fileId: file?.id ?? message.fileId,
-              thread,
-            });
-          } catch (error) {
-            sendPostError(message.clientId, error);
-          }
         };
 
         const onMessage = (raw: unknown): void => {
@@ -406,7 +499,7 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  pi.registerCommand("github-code-review", {
+  pi.registerCommand("pr-review", {
     description: "Open a native review window for a GitHub pull request (URL, owner/repo#N, or interactive picker)",
     handler: async (args, ctx) => {
       await reviewPullRequest(ctx, args);

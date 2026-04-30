@@ -1480,3 +1480,60 @@ renderTree();
 renderFileComments();
 updateSidebarLayout();
 setupMonaco();
+
+// --- Zoom controls -----------------------------------------------------
+const ZOOM_STORAGE_KEY = "pi-review-zoom";
+const ZOOM_DEFAULT = 1.2;
+const ZOOM_MIN = 0.5;
+const ZOOM_MAX = 3.0;
+const ZOOM_STEP = 0.1;
+const ZOOM_KEY_DELTAS = { "+": ZOOM_STEP, "=": ZOOM_STEP, "-": -ZOOM_STEP, "_": -ZOOM_STEP };
+
+function clampZoom(value) {
+  return Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Math.round(value * 100) / 100));
+}
+
+function loadZoom() {
+  try {
+    const parsed = parseFloat(localStorage.getItem(ZOOM_STORAGE_KEY) ?? "");
+    return Number.isFinite(parsed) ? parsed : ZOOM_DEFAULT;
+  } catch {
+    return ZOOM_DEFAULT;
+  }
+}
+
+function applyZoom(value) {
+  const clamped = clampZoom(value);
+  document.body.style.zoom = String(clamped);
+  try {
+    localStorage.setItem(ZOOM_STORAGE_KEY, String(clamped));
+  } catch {
+    /* ignore */
+  }
+  if (typeof layoutEditor === "function") {
+    requestAnimationFrame(() => layoutEditor());
+  }
+  return clamped;
+}
+
+let currentZoom = applyZoom(loadZoom());
+
+window.addEventListener("keydown", (event) => {
+  if (!(event.metaKey || event.ctrlKey)) return;
+  if (event.key === "0") {
+    event.preventDefault();
+    currentZoom = applyZoom(ZOOM_DEFAULT);
+    return;
+  }
+  const delta = ZOOM_KEY_DELTAS[event.key];
+  if (delta == null) return;
+  event.preventDefault();
+  currentZoom = applyZoom(currentZoom + delta);
+});
+
+window.addEventListener("wheel", (event) => {
+  if (!(event.metaKey || event.ctrlKey)) return;
+  if (event.deltaY === 0) return;
+  event.preventDefault();
+  currentZoom = applyZoom(currentZoom + (event.deltaY < 0 ? ZOOM_STEP : -ZOOM_STEP));
+}, { passive: false });
