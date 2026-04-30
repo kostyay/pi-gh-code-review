@@ -1,12 +1,8 @@
-const reviewData = JSON.parse(document.getElementById("diff-review-data").textContent || "{}");
+const reviewData = JSON.parse(document.getElementById("gh-review-data").textContent || "{}");
 
 const state = {
   activeFileId: null,
-  currentScope: reviewData.files.some((file) => file.inGitDiff)
-    ? "git-diff"
-    : reviewData.files.some((file) => file.inLastCommit)
-      ? "last-commit"
-      : "all-files",
+  currentScope: reviewData.files.some((file) => file.inPrDiff) ? "pr-diff" : "all-files",
   comments: [],
   overallComment: "",
   hideUnchanged: false,
@@ -19,17 +15,20 @@ const state = {
   fileContents: {},
   fileErrors: {},
   pendingRequestIds: {},
+  pendingPosts: {},
+  postErrors: {},
+  replyDrafts: {},
+  pendingReplies: {},
 };
 
 const sidebarEl = document.getElementById("sidebar");
 const sidebarTitleEl = document.getElementById("sidebar-title");
 const sidebarSearchInputEl = document.getElementById("sidebar-search-input");
 const toggleSidebarButton = document.getElementById("toggle-sidebar-button");
-const scopeDiffButton = document.getElementById("scope-diff-button");
-const scopeLastCommitButton = document.getElementById("scope-last-commit-button");
+const scopePrDiffButton = document.getElementById("scope-pr-diff-button");
 const scopeAllButton = document.getElementById("scope-all-button");
 const windowTitleEl = document.getElementById("window-title");
-const repoRootEl = document.getElementById("repo-root");
+const prMetaEl = document.getElementById("pr-meta");
 const fileTreeEl = document.getElementById("file-tree");
 const summaryEl = document.getElementById("summary");
 const currentFileLabelEl = document.getElementById("current-file-label");
@@ -44,8 +43,16 @@ const toggleReviewedButton = document.getElementById("toggle-reviewed-button");
 const toggleUnchangedButton = document.getElementById("toggle-unchanged-button");
 const toggleWrapButton = document.getElementById("toggle-wrap-button");
 
-repoRootEl.textContent = reviewData.repoRoot || "";
-windowTitleEl.textContent = "Review";
+const pr = reviewData.pr || {};
+windowTitleEl.textContent = pr.number != null ? `PR #${pr.number} — ${pr.title || ""}` : "Review";
+windowTitleEl.title = pr.url || "";
+const metaParts = [];
+if (pr.author) metaParts.push(`@${pr.author}`);
+if (pr.headRefName && pr.baseRefName) metaParts.push(`${pr.headRefName} → ${pr.baseRefName}`);
+if (pr.baseOwner && pr.baseRepo) metaParts.push(`${pr.baseOwner}/${pr.baseRepo}`);
+if (pr.state) metaParts.push(pr.state.toLowerCase());
+prMetaEl.textContent = metaParts.join(" • ");
+prMetaEl.title = pr.url || "";
 
 let monacoApi = null;
 let diffEditor = null;
@@ -65,47 +72,84 @@ function escapeHtml(value) {
     .replace(/\"/g, "&quot;");
 }
 
+const LANGUAGE_BY_EXT = {
+  ts: "typescript", tsx: "typescript",
+  js: "javascript", jsx: "javascript", mjs: "javascript", cjs: "javascript",
+  json: "json",
+  md: "markdown",
+  css: "css",
+  html: "html",
+  sh: "shell",
+  yml: "yaml", yaml: "yaml",
+  rs: "rust",
+  java: "java",
+  kt: "kotlin",
+  py: "python",
+  go: "go",
+};
+
 function inferLanguage(path) {
   if (!path) return "plaintext";
-  const lower = path.toLowerCase();
-  if (lower.endsWith(".ts") || lower.endsWith(".tsx")) return "typescript";
-  if (lower.endsWith(".js") || lower.endsWith(".jsx") || lower.endsWith(".mjs") || lower.endsWith(".cjs")) return "javascript";
-  if (lower.endsWith(".json")) return "json";
-  if (lower.endsWith(".md")) return "markdown";
-  if (lower.endsWith(".css")) return "css";
-  if (lower.endsWith(".html")) return "html";
-  if (lower.endsWith(".sh")) return "shell";
-  if (lower.endsWith(".yml") || lower.endsWith(".yaml")) return "yaml";
-  if (lower.endsWith(".rs")) return "rust";
-  if (lower.endsWith(".java")) return "java";
-  if (lower.endsWith(".kt")) return "kotlin";
-  if (lower.endsWith(".py")) return "python";
-  if (lower.endsWith(".go")) return "go";
-  return "plaintext";
+  const ext = path.toLowerCase().split(".").pop();
+  return LANGUAGE_BY_EXT[ext] || "plaintext";
 }
 
 function scopeLabel(scope) {
-  switch (scope) {
-    case "git-diff": return "Git diff";
-    case "last-commit": return "Last commit";
-    default: return "All files";
-  }
+  return scope === "pr-diff" ? "PR diff" : "All files";
 }
 
 function scopeHint(scope) {
-  switch (scope) {
-    case "git-diff":
-      return "Review working tree changes against HEAD. Hover or click line numbers in the gutter to add an inline comment.";
-    case "last-commit":
-      return "Review the last commit against its parent. Hover or click line numbers in the gutter to add an inline comment.";
-    default:
-      return "Review the current working tree snapshot. Hover or click line numbers in the gutter to add a code review comment.";
+  if (scope === "pr-diff") {
+    return "Review changes in this pull request (merge-base..head). Hover or click line numbers in the gutter to add an inline comment.";
   }
+  return "Browse the full PR head tree. Hover or click line numbers in the gutter to add a code review comment.";
 }
 
 function statusLabel(status) {
   if (!status) return "";
   return status.charAt(0).toUpperCase() + status.slice(1);
+}
+
+function escapeAttr(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function renderInlineMarkdown(text) {
+  const escaped = escapeHtml(text || "");
+  // Code blocks first
+  let html = escaped.replace(/```([\s\S]*?)```/g, (_, body) => `<pre style="margin:6px 0;padding:8px 10px;background:rgba(110,118,129,0.4);border-radius:6px;overflow-x:auto;"><code style="background:transparent;padding:0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;">${body}</code></pre>`);
+  // Inline code
+  html = html.replace(/`([^`\n]+)`/g, (_, body) => `<code>${body}</code>`);
+  // Bold
+  html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  // Bare URLs
+  html = html.replace(/(^|\s)(https?:\/\/[^\s<]+)/g, (match, prefix, url) => `${prefix}<a href="${escapeAttr(url)}" target="_blank" rel="noopener noreferrer">${url}</a>`);
+  return html;
+}
+
+const RELATIVE_TIME_UNITS = [
+  { limit: 60, divisor: 1, suffix: null },          // <60s
+  { limit: 3600, divisor: 60, suffix: "m" },
+  { limit: 86400, divisor: 3600, suffix: "h" },
+  { limit: 86400 * 30, divisor: 86400, suffix: "d" },
+  { limit: 86400 * 365, divisor: 86400 * 30, suffix: "mo" },
+  { limit: Infinity, divisor: 86400 * 365, suffix: "y" },
+];
+
+function formatRelativeTime(value) {
+  const ms = Date.parse(value);
+  if (!Number.isFinite(ms)) return "";
+  const diff = (Date.now() - ms) / 1000;
+  for (const unit of RELATIVE_TIME_UNITS) {
+    if (diff >= unit.limit) continue;
+    if (unit.suffix == null) return "just now";
+    return `${Math.floor(diff / unit.divisor)}${unit.suffix} ago`;
+  }
+  return "";
 }
 
 function statusBadgeClass(status) {
@@ -122,14 +166,10 @@ function isFileReviewed(fileId) {
 }
 
 function getScopedFiles() {
-  switch (state.currentScope) {
-    case "git-diff":
-      return reviewData.files.filter((file) => file.inGitDiff);
-    case "last-commit":
-      return reviewData.files.filter((file) => file.inLastCommit);
-    default:
-      return reviewData.files.filter((file) => file.hasWorkingTreeFile);
+  if (state.currentScope === "pr-diff") {
+    return reviewData.files.filter((file) => file.inPrDiff);
   }
+  return reviewData.files.filter((file) => file.hasHeadFile);
 }
 
 function ensureActiveFileForScope() {
@@ -150,9 +190,7 @@ function activeFile() {
 
 function getScopeComparison(file, scope = state.currentScope) {
   if (!file) return null;
-  if (scope === "git-diff") return file.gitDiff;
-  if (scope === "last-commit") return file.lastCommit;
-  return null;
+  return scope === "pr-diff" ? file.prDiff : null;
 }
 
 function activeComparison() {
@@ -184,7 +222,7 @@ function getBaseName(path) {
 
 function getActiveStatus(file) {
   const comparison = getScopeComparison(file, state.currentScope);
-  return comparison?.status ?? file?.worktreeStatus ?? null;
+  return comparison?.status ?? null;
 }
 
 function normalizeQuery(query) {
@@ -286,34 +324,6 @@ function cacheKey(scope, fileId) {
   return `${scope}:${fileId}`;
 }
 
-function scrollKey(scope, fileId) {
-  return `${scope}:${fileId}`;
-}
-
-function saveCurrentScrollPosition() {
-  if (!diffEditor || !state.activeFileId) return;
-  const originalEditor = diffEditor.getOriginalEditor();
-  const modifiedEditor = diffEditor.getModifiedEditor();
-  state.scrollPositions[scrollKey(state.currentScope, state.activeFileId)] = {
-    originalTop: originalEditor.getScrollTop(),
-    originalLeft: originalEditor.getScrollLeft(),
-    modifiedTop: modifiedEditor.getScrollTop(),
-    modifiedLeft: modifiedEditor.getScrollLeft(),
-  };
-}
-
-function restoreFileScrollPosition() {
-  if (!diffEditor || !state.activeFileId) return;
-  const scrollState = state.scrollPositions[scrollKey(state.currentScope, state.activeFileId)];
-  if (!scrollState) return;
-  const originalEditor = diffEditor.getOriginalEditor();
-  const modifiedEditor = diffEditor.getModifiedEditor();
-  originalEditor.setScrollTop(scrollState.originalTop);
-  originalEditor.setScrollLeft(scrollState.originalLeft);
-  modifiedEditor.setScrollTop(scrollState.modifiedTop);
-  modifiedEditor.setScrollLeft(scrollState.modifiedLeft);
-}
-
 function captureScrollState() {
   if (!diffEditor) return null;
   const originalEditor = diffEditor.getOriginalEditor();
@@ -334,6 +344,17 @@ function restoreScrollState(scrollState) {
   originalEditor.setScrollLeft(scrollState.originalLeft);
   modifiedEditor.setScrollTop(scrollState.modifiedTop);
   modifiedEditor.setScrollLeft(scrollState.modifiedLeft);
+}
+
+function saveCurrentScrollPosition() {
+  if (!state.activeFileId) return;
+  const captured = captureScrollState();
+  if (captured) state.scrollPositions[cacheKey(state.currentScope, state.activeFileId)] = captured;
+}
+
+function restoreFileScrollPosition() {
+  if (!state.activeFileId) return;
+  restoreScrollState(state.scrollPositions[cacheKey(state.currentScope, state.activeFileId)]);
 }
 
 function getRequestState(fileId, scope = state.currentScope) {
@@ -371,6 +392,39 @@ function openFile(fileId) {
   ensureFileLoaded(fileId, state.currentScope);
 }
 
+function threadCommentCountFor(file) {
+  if (state.currentScope !== "pr-diff") return 0;
+  return (file.threads || []).reduce((acc, thread) => acc + (thread.comments?.length || 0), 0);
+}
+
+function getFileDisplayMeta(file) {
+  const draftCount = state.comments.filter((comment) => comment.fileId === file.id && comment.scope === state.currentScope).length;
+  const requestState = getRequestState(file.id, state.currentScope);
+  return {
+    count: draftCount + threadCommentCountFor(file),
+    reviewed: isFileReviewed(file.id),
+    loading: requestState.requestId != null && requestState.contents == null,
+    errored: requestState.error != null,
+    status: getActiveStatus(file),
+  };
+}
+
+function statusDotMarkup(meta) {
+  const color = meta.reviewed ? "text-[#3fb950]" : meta.errored ? "text-red-400" : meta.loading ? "text-[#58a6ff]" : "text-transparent";
+  const glyph = meta.reviewed ? "●" : meta.errored ? "!" : meta.loading ? "…" : "●";
+  return `<span class="shrink-0 text-[10px] ${color}">${glyph}</span>`;
+}
+
+function countAndStatusMarkup(meta) {
+  const countBadge = meta.count > 0
+    ? `<span class="flex h-4 min-w-[16px] items-center justify-center rounded-full bg-[#1f2937] px-1 text-[10px] font-medium text-[#c9d1d9]">${meta.count}</span>`
+    : "";
+  const statusBadge = meta.status
+    ? `<span class="font-medium ${statusBadgeClass(meta.status)}">${escapeHtml(statusLabel(meta.status).charAt(0))}</span>`
+    : "";
+  return `${countBadge}${statusBadge}`;
+}
+
 function renderTreeNode(node, depth) {
   const children = [...node.children.values()].sort((a, b) => {
     if (a.kind !== b.kind) return a.kind === "dir" ? -1 : 1;
@@ -402,27 +456,22 @@ function renderTreeNode(node, depth) {
     }
 
     const file = child.file;
-    const count = state.comments.filter((comment) => comment.fileId === file.id && comment.scope === state.currentScope).length;
-    const reviewed = isFileReviewed(file.id);
-    const requestState = getRequestState(file.id, state.currentScope);
-    const loading = requestState.requestId != null && requestState.contents == null;
-    const errored = requestState.error != null;
-    const status = getActiveStatus(file);
+    const meta = getFileDisplayMeta(file);
+    const isActive = file.id === state.activeFileId;
     const button = document.createElement("button");
     button.type = "button";
     button.className = [
       "group flex w-full items-center justify-between gap-2 px-2 py-1 text-left text-[13px]",
-      file.id === state.activeFileId ? "bg-[#373e47] text-white" : reviewed ? "text-[#c9d1d9] hover:bg-[#21262d]" : "text-[#8b949e] hover:bg-[#21262d] hover:text-[#c9d1d9]",
+      isActive ? "bg-[#373e47] text-white" : meta.reviewed ? "text-[#c9d1d9] hover:bg-[#21262d]" : "text-[#8b949e] hover:bg-[#21262d] hover:text-[#c9d1d9]",
     ].join(" ");
     button.style.paddingLeft = `${(depth * indentPx) + 26}px`;
     button.innerHTML = `
-      <span class="flex min-w-0 items-center gap-1.5 truncate ${file.id === state.activeFileId ? "font-medium" : ""}">
-        <span class="shrink-0 text-[10px] ${reviewed ? "text-[#3fb950]" : errored ? "text-red-400" : loading ? "text-[#58a6ff]" : "text-transparent"}">${reviewed ? "●" : errored ? "!" : loading ? "…" : "●"}</span>
+      <span class="flex min-w-0 items-center gap-1.5 truncate ${isActive ? "font-medium" : ""}">
+        ${statusDotMarkup(meta)}
         <span class="truncate">${escapeHtml(child.name)}</span>
       </span>
       <span class="flex shrink-0 items-center gap-1.5">
-        ${count > 0 ? `<span class="flex h-4 min-w-[16px] items-center justify-center rounded-full bg-[#1f2937] px-1 text-[10px] font-medium text-[#c9d1d9]">${count}</span>` : ""}
-        ${status ? `<span class="font-medium ${statusBadgeClass(status)}">${escapeHtml(statusLabel(status).charAt(0))}</span>` : ""}
+        ${countAndStatusMarkup(meta)}
       </span>
     `;
     button.addEventListener("click", () => openFile(file.id));
@@ -435,29 +484,24 @@ function renderSearchResults(files) {
     const path = getFileSearchPath(file);
     const baseName = getBaseName(path);
     const parentPath = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
-    const count = state.comments.filter((comment) => comment.fileId === file.id && comment.scope === state.currentScope).length;
-    const reviewed = isFileReviewed(file.id);
-    const requestState = getRequestState(file.id, state.currentScope);
-    const loading = requestState.requestId != null && requestState.contents == null;
-    const errored = requestState.error != null;
-    const status = getActiveStatus(file);
+    const meta = getFileDisplayMeta(file);
+    const isActive = file.id === state.activeFileId;
     const button = document.createElement("button");
     button.type = "button";
     button.className = [
       "group flex w-full items-center justify-between gap-3 rounded-md px-2 py-2 text-left",
-      file.id === state.activeFileId ? "bg-[#373e47] text-white" : "text-[#c9d1d9] hover:bg-[#21262d]",
+      isActive ? "bg-[#373e47] text-white" : "text-[#c9d1d9] hover:bg-[#21262d]",
     ].join(" ");
     button.innerHTML = `
       <span class="min-w-0 flex-1">
         <span class="flex items-center gap-1.5">
-          <span class="shrink-0 text-[10px] ${reviewed ? "text-[#3fb950]" : errored ? "text-red-400" : loading ? "text-[#58a6ff]" : "text-transparent"}">${reviewed ? "●" : errored ? "!" : loading ? "…" : "●"}</span>
-          <span class="truncate text-[13px] ${file.id === state.activeFileId ? "font-medium" : ""}">${escapeHtml(baseName)}</span>
+          ${statusDotMarkup(meta)}
+          <span class="truncate text-[13px] ${isActive ? "font-medium" : ""}">${escapeHtml(baseName)}</span>
         </span>
-        <span class="mt-0.5 block truncate pl-[14px] text-[11px] ${file.id === state.activeFileId ? "text-[#c9d1d9]" : "text-review-muted"}">${escapeHtml(parentPath || path)}</span>
+        <span class="mt-0.5 block truncate pl-[14px] text-[11px] ${isActive ? "text-[#c9d1d9]" : "text-review-muted"}">${escapeHtml(parentPath || path)}</span>
       </span>
       <span class="flex shrink-0 items-center gap-1.5">
-        ${count > 0 ? `<span class="flex h-4 min-w-[16px] items-center justify-center rounded-full bg-[#1f2937] px-1 text-[10px] font-medium text-[#c9d1d9]">${count}</span>` : ""}
-        ${status ? `<span class="font-medium ${statusBadgeClass(status)}">${escapeHtml(statusLabel(status).charAt(0))}</span>` : ""}
+        ${countAndStatusMarkup(meta)}
       </span>
     `;
     button.addEventListener("click", () => openFile(file.id));
@@ -477,9 +521,8 @@ function updateSidebarLayout() {
 
 function updateScopeButtons() {
   const counts = {
-    diff: reviewData.files.filter((file) => file.inGitDiff).length,
-    lastCommit: reviewData.files.filter((file) => file.inLastCommit).length,
-    all: reviewData.files.filter((file) => file.hasWorkingTreeFile).length,
+    prDiff: reviewData.files.filter((file) => file.inPrDiff).length,
+    all: reviewData.files.filter((file) => file.hasHeadFile).length,
   };
 
   const applyButtonClasses = (button, active, disabled) => {
@@ -491,12 +534,10 @@ function updateScopeButtons() {
         : "cursor-pointer rounded-md border border-review-border bg-review-panel px-2.5 py-1 text-[11px] font-medium text-review-text hover:bg-[#21262d]";
   };
 
-  scopeDiffButton.textContent = `Git diff${counts.diff > 0 ? ` (${counts.diff})` : ""}`;
-  scopeLastCommitButton.textContent = `Last commit${counts.lastCommit > 0 ? ` (${counts.lastCommit})` : ""}`;
+  scopePrDiffButton.textContent = `PR diff${counts.prDiff > 0 ? ` (${counts.prDiff})` : ""}`;
   scopeAllButton.textContent = `All files${counts.all > 0 ? ` (${counts.all})` : ""}`;
 
-  applyButtonClasses(scopeDiffButton, state.currentScope === "git-diff", counts.diff === 0);
-  applyButtonClasses(scopeLastCommitButton, state.currentScope === "last-commit", counts.lastCommit === 0);
+  applyButtonClasses(scopePrDiffButton, state.currentScope === "pr-diff", counts.prDiff === 0);
   applyButtonClasses(scopeAllButton, state.currentScope === "all-files", counts.all === 0);
 }
 
@@ -553,9 +594,13 @@ function renderTree() {
   }
 
   sidebarTitleEl.textContent = scopeLabel(state.currentScope);
-  const comments = state.comments.length;
+  const drafts = state.comments.length;
+  const totalThreads = state.currentScope === "pr-diff"
+    ? reviewData.files.reduce((acc, file) => acc + (file.threads?.length || 0), 0) + (reviewData.orphanThreads?.length || 0)
+    : 0;
   const filteredSuffix = state.fileFilter.trim() ? ` • ${visibleFiles.length} shown` : "";
-  summaryEl.textContent = `${scopedFiles.length} file(s) • ${comments} comment(s)${state.overallComment ? " • overall note" : ""}${filteredSuffix}`;
+  const threadsSuffix = totalThreads > 0 ? ` • ${totalThreads} existing thread${totalThreads === 1 ? "" : "s"}` : "";
+  summaryEl.textContent = `${scopedFiles.length} file(s) • ${drafts} draft${drafts === 1 ? "" : "s"}${threadsSuffix}${state.overallComment ? " • overall note" : ""}${filteredSuffix}`;
   updateToggleButtons();
   updateSidebarLayout();
 }
@@ -647,28 +692,260 @@ function clearViewZones() {
   activeViewZones = [];
 }
 
+function buildThreadCommentMarkup(comment) {
+  const initial = (comment.author?.login || "?").charAt(0).toUpperCase();
+  const avatarSrc = comment.author?.avatarUrl ? `<img src="${escapeAttr(comment.author.avatarUrl)}" alt="${escapeAttr(comment.author.login || "")}">` : escapeHtml(initial);
+  const relative = formatRelativeTime(comment.createdAt);
+  const timestamp = relative ? `<span title="${escapeAttr(comment.createdAt)}">${escapeHtml(relative)}</span>` : "";
+  const link = comment.htmlUrl ? `<a href="${escapeAttr(comment.htmlUrl)}" target="_blank" rel="noopener noreferrer" style="color:#8b949e;">view</a>` : "";
+  const sep = timestamp && link ? "·" : "";
+  return `
+    <div class="gh-thread-comment">
+      <div class="gh-thread-avatar">${avatarSrc}</div>
+      <div class="gh-thread-body">
+        <div class="gh-thread-body-header">
+          <span class="gh-thread-author">${escapeHtml(comment.author?.login || "unknown")}</span>
+          ${timestamp}
+          ${sep ? `<span>${sep}</span>` : ""}
+          ${link}
+        </div>
+        <div class="gh-thread-body-text">${renderInlineMarkdown(comment.body || "")}</div>
+      </div>
+    </div>
+  `;
+}
+
+function buildThreadHeaderMarkup(thread) {
+  const sideLabel = thread.side === "base" ? "base" : "head";
+  let location;
+  if (thread.fileLevel) {
+    location = `${escapeHtml(thread.path)} (file-level)`;
+  } else if (thread.line == null) {
+    location = `${escapeHtml(thread.path)} (line not in current diff)`;
+  } else if (thread.startLine != null && thread.startLine !== thread.line) {
+    location = `${escapeHtml(thread.path)}:${thread.startLine}-${thread.line} (${sideLabel})`;
+  } else {
+    location = `${escapeHtml(thread.path)}:${thread.line} (${sideLabel})`;
+  }
+  const replyCount = Math.max(0, (thread.comments?.length || 1) - 1);
+  const repliesPart = replyCount > 0 ? `${replyCount} repl${replyCount === 1 ? "y" : "ies"}` : "";
+  const badges = [];
+  if (thread.outdated) badges.push(`<span class="gh-thread-badge outdated">Outdated</span>`);
+  if (thread.fileLevel) badges.push(`<span class="gh-thread-badge">File</span>`);
+  return `
+    <div class="gh-thread-header">
+      <div class="gh-thread-meta">
+        <span>${location}</span>
+        ${repliesPart ? `<span>· ${repliesPart}</span>` : ""}
+      </div>
+      <div class="gh-thread-meta">${badges.join("")}</div>
+    </div>
+  `;
+}
+
+function buildThreadReplyMarkup(thread) {
+  const draft = state.replyDrafts[thread.id] ?? "";
+  const open = draft.length > 0 || state.replyDraftOpen?.[thread.id] === true;
+  const pending = state.pendingReplies[thread.id] === true;
+  const error = state.postErrors[`reply:${thread.id}`] || "";
+  if (!open) {
+    return `
+      <div class="gh-thread-reply-bar" style="padding:6px 12px;border-top:1px solid #21262d;background:#0d1117;display:flex;justify-content:flex-end;">
+        <button data-action="open-reply" data-thread-id="${thread.id}" class="cursor-pointer rounded-md border border-review-border bg-review-panel px-3 py-1 text-xs font-medium text-review-text hover:bg-[#21262d]">Reply</button>
+      </div>
+    `;
+  }
+  return `
+    <div class="gh-thread-reply" style="padding:8px 12px 10px 12px;border-top:1px solid #21262d;background:#0d1117;">
+      <textarea data-action="reply-input" data-thread-id="${thread.id}" class="scrollbar-thin min-h-[60px] w-full resize-y rounded-md border border-review-border bg-[#010409] px-3 py-2 text-xs text-review-text outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500" placeholder="Reply…">${escapeHtml(draft)}</textarea>
+      ${error ? `<div style="margin-top:6px;padding:6px 8px;border-radius:6px;background:rgba(248,81,73,0.1);border:1px solid rgba(248,81,73,0.3);color:#ffa198;font-size:11px;">${escapeHtml(error)}</div>` : ""}
+      <div style="margin-top:6px;display:flex;justify-content:flex-end;gap:6px;">
+        <button data-action="cancel-reply" data-thread-id="${thread.id}" class="cursor-pointer rounded-md border border-review-border bg-review-panel px-3 py-1 text-xs font-medium text-review-text hover:bg-[#21262d]">Cancel</button>
+        <button data-action="post-reply" data-thread-id="${thread.id}" ${pending ? "disabled" : ""} class="cursor-pointer rounded-md border border-[rgba(240,246,252,0.1)] bg-[#238636] px-3 py-1 text-xs font-medium text-white hover:bg-[#2ea043] disabled:cursor-default disabled:opacity-60">${pending ? "Posting…" : "Reply"}</button>
+      </div>
+    </div>
+  `;
+}
+
+function renderThreadDOM(thread) {
+  const container = document.createElement("div");
+  container.className = "gh-thread";
+  const commentsHtml = (thread.comments || []).map(buildThreadCommentMarkup).join("");
+  container.innerHTML = `${buildThreadHeaderMarkup(thread)}${commentsHtml}${buildThreadReplyMarkup(thread)}`;
+  attachThreadHandlers(container, thread);
+  return container;
+}
+
+function attachThreadHandlers(container, thread) {
+  const openBtn = container.querySelector("[data-action='open-reply']");
+  if (openBtn) {
+    openBtn.addEventListener("click", () => {
+      state.replyDraftOpen = state.replyDraftOpen || {};
+      state.replyDraftOpen[thread.id] = true;
+      state.replyDrafts[thread.id] = state.replyDrafts[thread.id] ?? "";
+      updateCommentsUI();
+    });
+  }
+  const cancelBtn = container.querySelector("[data-action='cancel-reply']");
+  if (cancelBtn) {
+    cancelBtn.addEventListener("click", () => {
+      state.replyDraftOpen = state.replyDraftOpen || {};
+      state.replyDraftOpen[thread.id] = false;
+      delete state.replyDrafts[thread.id];
+      delete state.postErrors[`reply:${thread.id}`];
+      updateCommentsUI();
+    });
+  }
+  const postBtn = container.querySelector("[data-action='post-reply']");
+  if (postBtn) {
+    postBtn.addEventListener("click", () => postReply(thread.id));
+  }
+  const input = container.querySelector("[data-action='reply-input']");
+  if (input) {
+    input.addEventListener("input", () => {
+      state.replyDrafts[thread.id] = input.value;
+      if (state.postErrors[`reply:${thread.id}`]) {
+        delete state.postErrors[`reply:${thread.id}`];
+        const err = container.querySelector(".gh-thread-reply div[style*='ffa198']");
+        if (err) err.remove();
+      }
+    });
+    input.addEventListener("keydown", (event) => {
+      if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+        event.preventDefault();
+        postReply(thread.id);
+      }
+    });
+    setTimeout(() => input.focus(), 30);
+  }
+}
+
+function estimateThreadHeight(thread) {
+  const headerPx = 36;
+  const padding = 12;
+  let total = headerPx + padding;
+  for (const comment of thread.comments || []) {
+    const lines = String(comment.body || "").split(/\r?\n/).length;
+    total += 56 + Math.max(0, lines - 1) * 18;
+  }
+  return total;
+}
+
+
+function canPostInline(comment) {
+  if (comment.scope !== "pr-diff") return false;
+  if (comment.side === "file") return false;
+  if (comment.startLine == null) return false;
+  const file = reviewData.files.find((entry) => entry.id === comment.fileId);
+  if (!file || !file.prDiff) return false;
+  const sideHasPath = comment.side === "original"
+    ? file.prDiff.oldPath != null
+    : file.prDiff.newPath != null;
+  return sideHasPath;
+}
+
 function renderCommentDOM(comment, onDelete) {
   const container = document.createElement("div");
   container.className = "view-zone-container";
   const title = comment.side === "file"
     ? `File comment • ${scopeLabel(comment.scope)}`
-    : `${comment.side === "original" ? "Original" : "Modified"} line ${comment.startLine} • ${scopeLabel(comment.scope)}`;
+    : `${comment.side === "original" ? "Base" : "Head"} line ${comment.startLine} • ${scopeLabel(comment.scope)}`;
+
+  const postable = canPostInline(comment);
+  const pending = state.pendingPosts[comment.id] === true;
+  const postError = state.postErrors[comment.id] || "";
 
   container.innerHTML = `
     <div class="mb-2 flex items-center justify-between gap-3">
       <div class="text-xs font-semibold text-review-text">${escapeHtml(title)}</div>
-      <button data-action="delete" class="cursor-pointer rounded-md border border-transparent bg-transparent px-2 py-1 text-xs font-medium text-review-muted hover:bg-red-500/10 hover:text-red-400">Delete</button>
+      <div class="flex items-center gap-1">
+        ${postable ? `<button data-action="post" ${pending ? "disabled" : ""} class="cursor-pointer rounded-md border border-[rgba(240,246,252,0.1)] bg-[#238636] px-2 py-1 text-xs font-medium text-white hover:bg-[#2ea043] disabled:cursor-default disabled:opacity-60">${pending ? "Posting…" : "Post comment"}</button>` : ""}
+        <button data-action="delete" class="cursor-pointer rounded-md border border-transparent bg-transparent px-2 py-1 text-xs font-medium text-review-muted hover:bg-red-500/10 hover:text-red-400">Delete</button>
+      </div>
     </div>
-    <textarea data-comment-id="${escapeHtml(comment.id)}" class="scrollbar-thin min-h-[76px] w-full resize-y rounded-md border border-review-border bg-[#010409] px-3 py-2 text-sm text-review-text outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500" placeholder="Leave a comment"></textarea>
+    <textarea data-comment-id="${escapeAttr(comment.id)}" class="scrollbar-thin min-h-[76px] w-full resize-y rounded-md border border-review-border bg-[#010409] px-3 py-2 text-sm text-review-text outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500" placeholder="Leave a comment"></textarea>
+    ${postError ? `<div class="mt-2 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">${escapeHtml(postError)}</div>` : ""}
+    ${postable ? `<div class="mt-1 text-[10px] text-review-muted">Tip: Cmd/Ctrl+Enter posts to GitHub. Use “Finish review” to send all unposted drafts to the pi editor.</div>` : ""}
   `;
   const textarea = container.querySelector("textarea");
   textarea.value = comment.body || "";
   textarea.addEventListener("input", () => {
     comment.body = textarea.value;
+    if (state.postErrors[comment.id]) {
+      delete state.postErrors[comment.id];
+      const err = container.querySelector(".text-red-300");
+      if (err) err.remove();
+    }
+  });
+  textarea.addEventListener("keydown", (event) => {
+    if ((event.metaKey || event.ctrlKey) && event.key === "Enter" && postable) {
+      event.preventDefault();
+      postInlineDraft(comment);
+    }
   });
   container.querySelector("[data-action='delete']").addEventListener("click", onDelete);
+  const postButton = container.querySelector("[data-action='post']");
+  if (postButton) {
+    postButton.addEventListener("click", () => postInlineDraft(comment));
+  }
   if (!comment.body) setTimeout(() => textarea.focus(), 50);
   return container;
+}
+
+function postInlineDraft(comment) {
+  if (!canPostInline(comment)) return;
+  if (state.pendingPosts[comment.id]) return;
+  const body = (comment.body || "").trim();
+  if (body.length === 0) {
+    state.postErrors[comment.id] = "Comment body cannot be empty.";
+    updateCommentsUI();
+    return;
+  }
+  state.pendingPosts[comment.id] = true;
+  delete state.postErrors[comment.id];
+  if (window.glimpse?.send) {
+    window.glimpse.send({
+      type: "post-comment",
+      clientId: comment.id,
+      fileId: comment.fileId,
+      side: comment.side === "original" ? "base" : "head",
+      line: comment.startLine,
+      body,
+    });
+  }
+  updateCommentsUI();
+}
+
+function postReply(threadId) {
+  const draft = state.replyDrafts[threadId];
+  if (draft == null) return;
+  const body = String(draft).trim();
+  if (body.length === 0) {
+    state.postErrors[`reply:${threadId}`] = "Reply cannot be empty.";
+    updateCommentsUI();
+    return;
+  }
+  if (state.pendingReplies[threadId]) return;
+  const fileId = findFileIdForThread(threadId);
+  state.pendingReplies[threadId] = true;
+  delete state.postErrors[`reply:${threadId}`];
+  if (window.glimpse?.send) {
+    window.glimpse.send({
+      type: "post-reply",
+      clientId: `reply:${threadId}`,
+      fileId: fileId || "",
+      threadId,
+      body,
+    });
+  }
+  updateCommentsUI();
+}
+
+function findFileIdForThread(threadId) {
+  for (const file of reviewData.files) {
+    if ((file.threads || []).some((thread) => thread.id === threadId)) return file.id;
+  }
+  return null;
 }
 
 function canCommentOnSide(file, side) {
@@ -677,7 +954,7 @@ function canCommentOnSide(file, side) {
   if (side === "original") {
     return comparison != null && comparison.hasOriginal;
   }
-  return comparison != null ? comparison.hasModified : file.hasWorkingTreeFile;
+  return comparison != null ? comparison.hasModified : file.hasHeadFile;
 }
 
 function isActiveFileReady() {
@@ -685,6 +962,16 @@ function isActiveFileReady() {
   if (!file) return false;
   const requestState = getRequestState(file.id, state.currentScope);
   return requestState.contents != null && requestState.error == null;
+}
+
+function getInlineThreadsForFile(file) {
+  if (state.currentScope !== "pr-diff") return [];
+  return (file.threads || []).filter((thread) => !thread.outdated && !thread.fileLevel && thread.line != null);
+}
+
+function getNonInlineThreadsForFile(file) {
+  if (state.currentScope !== "pr-diff") return [];
+  return (file.threads || []).filter((thread) => thread.outdated || thread.fileLevel || thread.line == null);
 }
 
 function syncViewZones() {
@@ -714,6 +1001,20 @@ function syncViewZones() {
       activeViewZones.push({ id, editor });
     });
   });
+
+  const inlineThreads = getInlineThreadsForFile(file);
+  inlineThreads.forEach((thread) => {
+    const editor = thread.side === "base" ? originalEditor : modifiedEditor;
+    const domNode = renderThreadDOM(thread);
+    editor.changeViewZones((accessor) => {
+      const id = accessor.addZone({
+        afterLineNumber: thread.line,
+        heightInPx: estimateThreadHeight(thread),
+        domNode,
+      });
+      activeViewZones.push({ id, editor });
+    });
+  });
 }
 
 function updateDecorations() {
@@ -736,6 +1037,24 @@ function updateDecorations() {
     else modifiedRanges.push(range);
   }
 
+  if (file) {
+    const inlineThreads = getInlineThreadsForFile(file);
+    for (const thread of inlineThreads) {
+      const startLine = thread.startLine ?? thread.line;
+      const endLine = thread.line;
+      const range = {
+        range: new monacoApi.Range(startLine, 1, endLine, 1),
+        options: {
+          isWholeLine: true,
+          className: thread.side === "base" ? "gh-thread-line-original" : "gh-thread-line-modified",
+          glyphMarginClassName: "gh-thread-glyph",
+        },
+      };
+      if (thread.side === "base") originalRanges.push(range);
+      else modifiedRanges.push(range);
+    }
+  }
+
   originalDecorations = diffEditor.getOriginalEditor().deltaDecorations(originalDecorations, originalRanges);
   modifiedDecorations = diffEditor.getModifiedEditor().deltaDecorations(modifiedDecorations, modifiedRanges);
 }
@@ -749,19 +1068,27 @@ function renderFileComments() {
   }
 
   const fileComments = state.comments.filter((comment) => comment.fileId === file.id && comment.scope === state.currentScope && comment.side === "file");
+  const nonInlineThreads = getNonInlineThreadsForFile(file);
 
-  if (fileComments.length === 0) {
+  if (fileComments.length === 0 && nonInlineThreads.length === 0) {
     fileCommentsContainer.className = "hidden overflow-hidden px-0 py-0";
     return;
   }
 
   fileCommentsContainer.className = "border-b border-review-border bg-[#0d1117] px-4 py-4 space-y-4";
+
   fileComments.forEach((comment) => {
     const dom = renderCommentDOM(comment, () => {
       state.comments = state.comments.filter((item) => item.id !== comment.id);
       updateCommentsUI();
     });
     dom.className = "rounded-lg border border-review-border bg-review-panel p-4";
+    fileCommentsContainer.appendChild(dom);
+  });
+
+  nonInlineThreads.forEach((thread) => {
+    const dom = renderThreadDOM(thread);
+    dom.style.margin = "0";
     fileCommentsContainer.appendChild(dom);
   });
 }
@@ -820,15 +1147,14 @@ function mountFile(options = {}) {
   syncViewZones();
   updateDecorations();
   renderFileComments();
-  requestAnimationFrame(() => {
+  const applyScroll = () => {
     layoutEditor();
     if (options.restoreFileScroll) restoreFileScrollPosition();
     if (options.preserveScroll) restoreScrollState(scrollState);
-    setTimeout(() => {
-      layoutEditor();
-      if (options.restoreFileScroll) restoreFileScrollPosition();
-      if (options.preserveScroll) restoreScrollState(scrollState);
-    }, 50);
+  };
+  requestAnimationFrame(() => {
+    applyScroll();
+    setTimeout(applyScroll, 50);
   });
 }
 
@@ -918,8 +1244,59 @@ function createGlyphHoverActions(editor, side) {
   });
 }
 
+function mergeUpdatedThread(fileId, thread) {
+  const file = reviewData.files.find((entry) => entry.id === fileId);
+  if (!file) {
+    reviewData.orphanThreads = reviewData.orphanThreads || [];
+    const existingIdx = reviewData.orphanThreads.findIndex((t) => t.id === thread.id);
+    if (existingIdx >= 0) reviewData.orphanThreads[existingIdx] = thread;
+    else reviewData.orphanThreads.push(thread);
+    return;
+  }
+  file.threads = file.threads || [];
+  const idx = file.threads.findIndex((t) => t.id === thread.id);
+  if (idx >= 0) file.threads[idx] = thread;
+  else file.threads.push(thread);
+}
+
 window.__reviewReceive = function (message) {
   if (!message || typeof message !== "object") return;
+
+  if (message.type === "thread-updated") {
+    const clientId = message.clientId;
+    mergeUpdatedThread(message.fileId, message.thread);
+    if (state.pendingPosts[clientId]) {
+      delete state.pendingPosts[clientId];
+      delete state.postErrors[clientId];
+      state.comments = state.comments.filter((comment) => comment.id !== clientId);
+    }
+    if (clientId && clientId.startsWith("reply:")) {
+      const threadId = Number(clientId.slice("reply:".length));
+      delete state.pendingReplies[threadId];
+      delete state.postErrors[clientId];
+      delete state.replyDrafts[threadId];
+      if (state.replyDraftOpen) state.replyDraftOpen[threadId] = false;
+    }
+    const scrollState = captureScrollState();
+    updateCommentsUI();
+    if (scrollState) restoreScrollState(scrollState);
+    return;
+  }
+
+  if (message.type === "post-error") {
+    const clientId = message.clientId;
+    if (clientId && clientId.startsWith("reply:")) {
+      const threadId = Number(clientId.slice("reply:".length));
+      delete state.pendingReplies[threadId];
+      state.postErrors[clientId] = message.message || "Failed to post reply.";
+    } else if (clientId) {
+      delete state.pendingPosts[clientId];
+      state.postErrors[clientId] = message.message || "Failed to post comment.";
+    }
+    updateCommentsUI();
+    return;
+  }
+
   const key = cacheKey(message.scope, message.fileId);
 
   if (message.type === "file-data") {
@@ -1007,9 +1384,8 @@ function setupMonaco() {
 
 function switchScope(scope) {
   const hasScopeFiles = {
-    "git-diff": reviewData.files.some((file) => file.inGitDiff),
-    "last-commit": reviewData.files.some((file) => file.inLastCommit),
-    "all-files": reviewData.files.some((file) => file.hasWorkingTreeFile),
+    "pr-diff": reviewData.files.some((file) => file.inPrDiff),
+    "all-files": reviewData.files.some((file) => file.hasHeadFile),
   };
   if (!hasScopeFiles[scope] || state.currentScope === scope) return;
   saveCurrentScrollPosition();
@@ -1069,12 +1445,8 @@ toggleReviewedButton.addEventListener("click", () => {
   renderTree();
 });
 
-scopeDiffButton.addEventListener("click", () => {
-  switchScope("git-diff");
-});
-
-scopeLastCommitButton.addEventListener("click", () => {
-  switchScope("last-commit");
+scopePrDiffButton.addEventListener("click", () => {
+  switchScope("pr-diff");
 });
 
 scopeAllButton.addEventListener("click", () => {
