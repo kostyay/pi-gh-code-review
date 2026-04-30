@@ -1,35 +1,82 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth } from "@mariozechner/pi-tui";
 import { open, type GlimpseWindow } from "glimpseui";
-import { getReviewWindowData, loadReviewFileContents } from "./git.js";
+import {
+  getReviewWindowData,
+  listOpenPullRequests,
+  loadReviewFileContents,
+  parsePullRequestSpec,
+  postCommentReply,
+  postLineComment,
+  preparePullRequest,
+  type PullRequestRef,
+} from "./pr.js";
 import { composeReviewPrompt } from "./prompt.js";
 import type {
+  PullRequestSummary,
   ReviewCancelPayload,
   ReviewFile,
   ReviewFileContents,
   ReviewHostMessage,
+  ReviewPostCommentPayload,
+  ReviewPostReplyPayload,
   ReviewRequestFilePayload,
   ReviewSubmitPayload,
   ReviewWindowMessage,
 } from "./types.js";
 import { buildReviewHtml } from "./ui.js";
 
-function isSubmitPayload(value: ReviewWindowMessage): value is ReviewSubmitPayload {
-  return value.type === "submit";
-}
-
-function isCancelPayload(value: ReviewWindowMessage): value is ReviewCancelPayload {
-  return value.type === "cancel";
-}
-
-function isRequestFilePayload(value: ReviewWindowMessage): value is ReviewRequestFilePayload {
-  return value.type === "request-file";
-}
-
 type WaitingEditorResult = "escape" | "window-settled";
 
 function escapeForInlineScript(value: string): string {
   return value.replace(/</g, "\\u003c").replace(/>/g, "\\u003e").replace(/&/g, "\\u0026");
+}
+
+function formatPullRequestOption(pr: PullRequestSummary): string {
+  return `#${pr.number}  ${pr.title}  —  @${pr.author}  (${pr.headRefName} → ${pr.baseRefName})`;
+}
+
+async function resolvePullRequestSpec(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  args: string,
+): Promise<PullRequestRef | null> {
+  const trimmed = args.trim();
+  if (trimmed.length > 0) {
+    const parsed = parsePullRequestSpec(trimmed);
+    if (parsed == null) {
+      ctx.ui.notify("Could not parse PR. Provide a GitHub PR URL or owner/repo#number.", "error");
+      return null;
+    }
+    return parsed;
+  }
+
+  let summaries: PullRequestSummary[];
+  try {
+    summaries = await listOpenPullRequests(pi, ctx.cwd);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    ctx.ui.notify(message, "error");
+    return null;
+  }
+
+  if (summaries.length === 0) {
+    ctx.ui.notify("No open pull requests found in the current repository.", "info");
+    return null;
+  }
+
+  const labels = summaries.map(formatPullRequestOption);
+  const choice = await ctx.ui.select("Select a pull request to review", labels);
+  if (choice == null) return null;
+  const index = labels.indexOf(choice);
+  if (index < 0) return null;
+  const selected = summaries[index];
+  const parsed = parsePullRequestSpec(selected.url);
+  if (parsed == null) {
+    ctx.ui.notify(`Could not parse PR url: ${selected.url}`, "error");
+    return null;
+  }
+  return parsed;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -111,28 +158,42 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
-  async function reviewRepository(ctx: ExtensionCommandContext): Promise<void> {
+  async function reviewPullRequest(ctx: ExtensionCommandContext, args: string): Promise<void> {
     if (activeWindow != null) {
       ctx.ui.notify("A review window is already open.", "warning");
       return;
     }
 
-    const { repoRoot, files } = await getReviewWindowData(pi, ctx.cwd);
-    if (files.length === 0) {
-      ctx.ui.notify("No reviewable files found.", "info");
+    const ref = await resolvePullRequestSpec(pi, ctx, args);
+    if (ref == null) return;
+
+    ctx.ui.notify(`Fetching PR #${ref.number} from ${ref.owner}/${ref.repo}...`, "info");
+
+    let prepared;
+    try {
+      prepared = await preparePullRequest(pi, ref);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      ctx.ui.notify(`Failed to prepare PR: ${message}`, "error");
       return;
     }
 
-    const html = buildReviewHtml({ repoRoot, files });
+    const data = await getReviewWindowData(pi, prepared);
+    if (data.files.length === 0) {
+      ctx.ui.notify("No reviewable files found in this PR.", "info");
+      return;
+    }
+
+    const html = buildReviewHtml(data);
     const window = open(html, {
       width: 1680,
       height: 1020,
-      title: "pi review",
+      title: `PR #${data.pr.number} — ${data.pr.title}`,
     });
     activeWindow = window;
 
     const waitingUI = showWaitingUI(ctx);
-    const fileMap = new Map(files.map((file) => [file.id, file]));
+    const fileMap = new Map(data.files.map((file) => [file.id, file]));
     const contentCache = new Map<string, Promise<ReviewFileContents>>();
 
     const sendWindowMessage = (message: ReviewHostMessage): void => {
@@ -146,12 +207,12 @@ export default function (pi: ExtensionAPI) {
       const cached = contentCache.get(cacheKey);
       if (cached != null) return cached;
 
-      const pending = loadReviewFileContents(pi, repoRoot, file, scope);
+      const pending = loadReviewFileContents(pi, data, file, scope);
       contentCache.set(cacheKey, pending);
       return pending;
     };
 
-    ctx.ui.notify("Opened native review window.", "info");
+    ctx.ui.notify(`Opened review window for PR #${data.pr.number}.`, "info");
 
     try {
       const terminalMessagePromise = new Promise<ReviewSubmitPayload | ReviewCancelPayload | null>((resolve, reject) => {
@@ -208,14 +269,90 @@ export default function (pi: ExtensionAPI) {
           }
         };
 
-        const onMessage = (data: unknown): void => {
-          const message = data as ReviewWindowMessage;
-          if (isRequestFilePayload(message)) {
-            void handleRequestFile(message);
+        const prRef: PullRequestRef = {
+          owner: data.pr.baseOwner,
+          repo: data.pr.baseRepo,
+          number: data.pr.number,
+        };
+
+        const sendPostError = (clientId: string, error: unknown): void => {
+          const text = error instanceof Error ? error.message : String(error);
+          sendWindowMessage({ type: "post-error", clientId, message: text });
+        };
+
+        const handlePostComment = async (message: ReviewPostCommentPayload): Promise<void> => {
+          const file = data.files.find((entry) => entry.id === message.fileId);
+          if (file == null) {
+            sendWindowMessage({ type: "post-error", clientId: message.clientId, message: "Unknown file." });
             return;
           }
-          if (isSubmitPayload(message) || isCancelPayload(message)) {
-            settle(message);
+          const path = message.side === "head"
+            ? file.prDiff?.newPath ?? file.path
+            : file.prDiff?.oldPath ?? file.path;
+          if (path == null) {
+            sendWindowMessage({ type: "post-error", clientId: message.clientId, message: "No path available for this side." });
+            return;
+          }
+          try {
+            const thread = await postLineComment(pi, prRef, {
+              path,
+              side: message.side,
+              line: message.line,
+              body: message.body,
+              commitSha: data.pr.headRefOid,
+            });
+            file.threads.push(thread);
+            sendWindowMessage({ type: "thread-updated", clientId: message.clientId, fileId: file.id, thread });
+          } catch (error) {
+            sendPostError(message.clientId, error);
+          }
+        };
+
+        const findThreadOwner = (threadId: number): { file: ReviewFile | null; thread: typeof data.files[number]["threads"][number] | null } => {
+          for (const file of data.files) {
+            const thread = file.threads.find((t) => t.id === threadId);
+            if (thread != null) return { file, thread };
+          }
+          const orphan = data.orphanThreads.find((t) => t.id === threadId) ?? null;
+          return { file: null, thread: orphan };
+        };
+
+        const handlePostReply = async (message: ReviewPostReplyPayload): Promise<void> => {
+          const { file, thread } = findThreadOwner(message.threadId);
+          if (thread == null) {
+            sendWindowMessage({ type: "post-error", clientId: message.clientId, message: "Thread not found." });
+            return;
+          }
+          try {
+            const comment = await postCommentReply(pi, prRef, message.threadId, message.body);
+            thread.comments.push(comment);
+            sendWindowMessage({
+              type: "thread-updated",
+              clientId: message.clientId,
+              fileId: file?.id ?? message.fileId,
+              thread,
+            });
+          } catch (error) {
+            sendPostError(message.clientId, error);
+          }
+        };
+
+        const onMessage = (raw: unknown): void => {
+          const message = raw as ReviewWindowMessage;
+          switch (message.type) {
+            case "request-file":
+              void handleRequestFile(message);
+              return;
+            case "post-comment":
+              void handlePostComment(message);
+              return;
+            case "post-reply":
+              void handlePostReply(message);
+              return;
+            case "submit":
+            case "cancel":
+              settle(message);
+              return;
           }
         };
 
@@ -258,7 +395,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      const prompt = composeReviewPrompt(files, message);
+      const prompt = composeReviewPrompt(data.pr, data.files, message);
       ctx.ui.setEditorText(prompt);
       ctx.ui.notify("Inserted review feedback into the editor.", "info");
     } catch (error) {
@@ -269,10 +406,10 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  pi.registerCommand("diff-review", {
-    description: "Open a native review window with git diff, last commit, and all files scopes",
-    handler: async (_args, ctx) => {
-      await reviewRepository(ctx);
+  pi.registerCommand("github-code-review", {
+    description: "Open a native review window for a GitHub pull request (URL, owner/repo#N, or interactive picker)",
+    handler: async (args, ctx) => {
+      await reviewPullRequest(ctx, args);
     },
   });
 

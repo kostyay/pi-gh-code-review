@@ -1,4 +1,4 @@
-export type ReviewScope = "git-diff" | "last-commit" | "all-files";
+export type ReviewScope = "pr-diff" | "all-files";
 
 export type ChangeStatus = "modified" | "added" | "deleted" | "renamed";
 
@@ -14,12 +14,40 @@ export interface ReviewFileComparison {
 export interface ReviewFile {
   id: string;
   path: string;
-  worktreeStatus: ChangeStatus | null;
-  hasWorkingTreeFile: boolean;
-  inGitDiff: boolean;
-  inLastCommit: boolean;
-  gitDiff: ReviewFileComparison | null;
-  lastCommit: ReviewFileComparison | null;
+  inPrDiff: boolean;
+  hasHeadFile: boolean;
+  prDiff: ReviewFileComparison | null;
+  threads: PrReviewThread[];
+}
+
+export type PrCommentSide = "base" | "head";
+
+export interface PrReviewCommentAuthor {
+  login: string;
+  avatarUrl: string | null;
+}
+
+export interface PrReviewComment {
+  id: number;
+  threadId: number;
+  body: string;
+  author: PrReviewCommentAuthor;
+  createdAt: string;
+  updatedAt: string;
+  htmlUrl: string;
+  diffHunk: string;
+}
+
+export interface PrReviewThread {
+  id: number;
+  path: string;
+  side: PrCommentSide;
+  line: number | null;
+  startLine: number | null;
+  startSide: PrCommentSide | null;
+  outdated: boolean;
+  fileLevel: boolean;
+  comments: PrReviewComment[];
 }
 
 export interface ReviewFileContents {
@@ -56,7 +84,29 @@ export interface ReviewRequestFilePayload {
   scope: ReviewScope;
 }
 
-export type ReviewWindowMessage = ReviewSubmitPayload | ReviewCancelPayload | ReviewRequestFilePayload;
+export interface ReviewPostCommentPayload {
+  type: "post-comment";
+  clientId: string;
+  fileId: string;
+  side: PrCommentSide;
+  line: number;
+  body: string;
+}
+
+export interface ReviewPostReplyPayload {
+  type: "post-reply";
+  clientId: string;
+  fileId: string;
+  threadId: number;
+  body: string;
+}
+
+export type ReviewWindowMessage =
+  | ReviewSubmitPayload
+  | ReviewCancelPayload
+  | ReviewRequestFilePayload
+  | ReviewPostCommentPayload
+  | ReviewPostReplyPayload;
 
 export interface ReviewFileDataMessage {
   type: "file-data";
@@ -75,9 +125,55 @@ export interface ReviewFileErrorMessage {
   message: string;
 }
 
-export type ReviewHostMessage = ReviewFileDataMessage | ReviewFileErrorMessage;
+export interface ReviewThreadUpdatedMessage {
+  type: "thread-updated";
+  clientId: string;
+  fileId: string;
+  thread: PrReviewThread;
+}
+
+export interface ReviewPostErrorMessage {
+  type: "post-error";
+  clientId: string;
+  message: string;
+}
+
+export type ReviewHostMessage =
+  | ReviewFileDataMessage
+  | ReviewFileErrorMessage
+  | ReviewThreadUpdatedMessage
+  | ReviewPostErrorMessage;
+
+export interface PullRequestInfo {
+  url: string;
+  number: number;
+  title: string;
+  body: string;
+  author: string;
+  state: string;
+  headRefName: string;
+  baseRefName: string;
+  headRefOid: string;
+  baseRefOid: string;
+  mergeBase: string;
+  baseOwner: string;
+  baseRepo: string;
+  isCrossRepository: boolean;
+}
 
 export interface ReviewWindowData {
-  repoRoot: string;
+  pr: PullRequestInfo;
+  workDir: string;
   files: ReviewFile[];
+  orphanThreads: PrReviewThread[];
+}
+
+export interface PullRequestSummary {
+  url: string;
+  number: number;
+  title: string;
+  author: string;
+  headRefName: string;
+  baseRefName: string;
+  state: string;
 }
