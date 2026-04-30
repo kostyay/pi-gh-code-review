@@ -124,13 +124,18 @@ function isWriteMethod(method: string): boolean {
   return method !== "GET" && method !== "HEAD";
 }
 
+function readNumericHeader(headers: Headers, name: string): number | null {
+  const value = headers.get(name);
+  if (value == null) return null;
+  const num = Number(value);
+  return Number.isFinite(num) ? num : null;
+}
+
 function updateRateLimitFromHeaders(headers: Headers): void {
-  const remaining = headers.get("x-ratelimit-remaining");
-  const reset = headers.get("x-ratelimit-reset");
-  const remainingNum = remaining != null ? Number(remaining) : Number.NaN;
-  const resetNum = reset != null ? Number(reset) : Number.NaN;
-  if (Number.isFinite(remainingNum)) rateLimitRemaining = remainingNum;
-  if (Number.isFinite(resetNum)) rateLimitResetEpochSec = resetNum;
+  const remaining = readNumericHeader(headers, "x-ratelimit-remaining");
+  const reset = readNumericHeader(headers, "x-ratelimit-reset");
+  if (remaining != null) rateLimitRemaining = remaining;
+  if (reset != null) rateLimitResetEpochSec = reset;
 }
 
 function parseRetryAfterMs(headers: Headers): number | null {
@@ -143,23 +148,18 @@ function parseRetryAfterMs(headers: Headers): number | null {
   return null;
 }
 
-function rateLimitResetEta(): string {
-  if (rateLimitResetEpochSec == null) return "soon";
-  return new Date(rateLimitResetEpochSec * 1000).toISOString();
-}
-
 async function waitForPrimaryRateLimit(): Promise<void> {
   if (rateLimitRemaining == null || rateLimitRemaining > 0) return;
   if (rateLimitResetEpochSec == null) return;
-  const waitMs = rateLimitResetEpochSec * 1000 - Date.now();
+  const resetMs = rateLimitResetEpochSec * 1000;
+  const waitMs = resetMs - Date.now();
   if (waitMs <= 0) {
     rateLimitRemaining = null;
     return;
   }
   if (waitMs > MAX_RATE_LIMIT_WAIT_MS) {
-    throw new Error(
-      `GitHub primary rate limit exhausted. Resets at ${rateLimitResetEta()}. Try again later.`,
-    );
+    const eta = new Date(resetMs).toISOString();
+    throw new Error(`GitHub primary rate limit exhausted. Resets at ${eta}. Try again later.`);
   }
   await sleep(waitMs + 250);
   rateLimitRemaining = null;
