@@ -1,3 +1,9 @@
+export interface PullRequestRef {
+  owner: string;
+  repo: string;
+  number: number;
+}
+
 export type ReviewScope = "pr-diff" | "all-files";
 
 export type ChangeStatus = "modified" | "added" | "deleted" | "renamed";
@@ -9,15 +15,6 @@ export interface ReviewFileComparison {
   displayPath: string;
   hasOriginal: boolean;
   hasModified: boolean;
-}
-
-export interface ReviewFile {
-  id: string;
-  path: string;
-  inPrDiff: boolean;
-  hasHeadFile: boolean;
-  prDiff: ReviewFileComparison | null;
-  threads: PrReviewThread[];
 }
 
 export type PrCommentSide = "base" | "head";
@@ -48,6 +45,15 @@ export interface PrReviewThread {
   outdated: boolean;
   fileLevel: boolean;
   comments: PrReviewComment[];
+}
+
+export interface ReviewFile {
+  id: string;
+  path: string;
+  inPrDiff: boolean;
+  hasHeadFile: boolean;
+  prDiff: ReviewFileComparison | null;
+  threads: PrReviewThread[];
 }
 
 export interface ReviewFileContents {

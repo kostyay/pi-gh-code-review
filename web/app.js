@@ -1480,3 +1480,65 @@ renderTree();
 renderFileComments();
 updateSidebarLayout();
 setupMonaco();
+
+// --- Zoom controls -----------------------------------------------------
+const ZOOM_STORAGE_KEY = "pi-review-zoom";
+const ZOOM_DEFAULT = 1.2;
+const ZOOM_MIN = 0.5;
+const ZOOM_MAX = 3.0;
+const ZOOM_STEP = 0.1;
+
+function loadZoom() {
+  try {
+    const raw = localStorage.getItem(ZOOM_STORAGE_KEY);
+    if (raw == null) return ZOOM_DEFAULT;
+    const parsed = parseFloat(raw);
+    if (!Number.isFinite(parsed)) return ZOOM_DEFAULT;
+    return Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, parsed));
+  } catch {
+    return ZOOM_DEFAULT;
+  }
+}
+
+function applyZoom(value) {
+  const clamped = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Math.round(value * 100) / 100));
+  document.body.style.zoom = String(clamped);
+  try {
+    localStorage.setItem(ZOOM_STORAGE_KEY, String(clamped));
+  } catch {
+    /* ignore */
+  }
+  if (typeof layoutEditor === "function") {
+    requestAnimationFrame(() => layoutEditor());
+  }
+  return clamped;
+}
+
+let currentZoom = applyZoom(loadZoom());
+
+window.addEventListener("keydown", (event) => {
+  if (!(event.metaKey || event.ctrlKey)) return;
+  // Ignore when typing in an input/textarea/contenteditable, except for the
+  // explicit zoom keys which should still work globally.
+  const key = event.key;
+  const isZoomIn = key === "+" || key === "=";
+  const isZoomOut = key === "-" || key === "_";
+  const isZoomReset = key === "0";
+  if (!isZoomIn && !isZoomOut && !isZoomReset) return;
+  event.preventDefault();
+  if (isZoomReset) {
+    currentZoom = applyZoom(ZOOM_DEFAULT);
+  } else if (isZoomIn) {
+    currentZoom = applyZoom(currentZoom + ZOOM_STEP);
+  } else {
+    currentZoom = applyZoom(currentZoom - ZOOM_STEP);
+  }
+});
+
+window.addEventListener("wheel", (event) => {
+  if (!(event.metaKey || event.ctrlKey)) return;
+  event.preventDefault();
+  const delta = event.deltaY;
+  if (delta === 0) return;
+  currentZoom = applyZoom(currentZoom + (delta < 0 ? ZOOM_STEP : -ZOOM_STEP));
+}, { passive: false });
