@@ -10,6 +10,13 @@ import type {
 const GITHUB_API_BASE = "https://api.github.com";
 const GITHUB_API_VERSION = "2022-11-28";
 
+// Rate-limit handling. GitHub returns x-ratelimit-* on every response and uses
+// 403/429 with `retry-after` for primary and secondary (abuse) limits.
+// Reference: https://docs.github.com/rest/guides/best-practices-for-using-the-rest-api
+const MAX_RATE_LIMIT_WAIT_MS = 60_000;
+const MIN_WRITE_INTERVAL_MS = 1_000;
+const MAX_RATE_LIMIT_RETRIES = 3;
+
 // ---------------------------------------------------------------------------
 // Generic command runner (used for both gh-token fallback and git invocations).
 // ---------------------------------------------------------------------------
@@ -67,8 +74,10 @@ export async function ensureGitHubAuth(pi: ExtensionAPI): Promise<void> {
 // REST API helpers (fetch).
 // ---------------------------------------------------------------------------
 
+type HttpMethod = "GET" | "POST" | "PATCH" | "DELETE" | "PUT";
+
 interface ApiRequestInit {
-  method?: "GET" | "POST" | "PATCH" | "DELETE" | "PUT";
+  method?: HttpMethod;
   body?: unknown;
 }
 
@@ -101,17 +110,105 @@ async function readErrorDetail(response: Response): Promise<string> {
   return text.length > 0 ? `${response.status} ${text}` : `${response.status} ${response.statusText}`;
 }
 
+// --- Rate-limit aware fetch ------------------------------------------------
+
+let rateLimitRemaining: number | null = null;
+let rateLimitResetEpochSec: number | null = null;
+let lastWriteAt = 0;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isWriteMethod(method: string): boolean {
+  return method !== "GET" && method !== "HEAD";
+}
+
+function updateRateLimitFromHeaders(headers: Headers): void {
+  const remaining = headers.get("x-ratelimit-remaining");
+  const reset = headers.get("x-ratelimit-reset");
+  const remainingNum = remaining != null ? Number(remaining) : Number.NaN;
+  const resetNum = reset != null ? Number(reset) : Number.NaN;
+  if (Number.isFinite(remainingNum)) rateLimitRemaining = remainingNum;
+  if (Number.isFinite(resetNum)) rateLimitResetEpochSec = resetNum;
+}
+
+function parseRetryAfterMs(headers: Headers): number | null {
+  const value = headers.get("retry-after");
+  if (value == null) return null;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+  const date = Date.parse(value);
+  if (Number.isFinite(date)) return Math.max(0, date - Date.now());
+  return null;
+}
+
+function rateLimitResetEta(): string {
+  if (rateLimitResetEpochSec == null) return "soon";
+  return new Date(rateLimitResetEpochSec * 1000).toISOString();
+}
+
+async function waitForPrimaryRateLimit(): Promise<void> {
+  if (rateLimitRemaining == null || rateLimitRemaining > 0) return;
+  if (rateLimitResetEpochSec == null) return;
+  const waitMs = rateLimitResetEpochSec * 1000 - Date.now();
+  if (waitMs <= 0) {
+    rateLimitRemaining = null;
+    return;
+  }
+  if (waitMs > MAX_RATE_LIMIT_WAIT_MS) {
+    throw new Error(
+      `GitHub primary rate limit exhausted. Resets at ${rateLimitResetEta()}. Try again later.`,
+    );
+  }
+  await sleep(waitMs + 250);
+  rateLimitRemaining = null;
+}
+
+async function waitForWriteSpacing(method: string): Promise<void> {
+  if (!isWriteMethod(method)) return;
+  const elapsed = Date.now() - lastWriteAt;
+  if (elapsed < MIN_WRITE_INTERVAL_MS) await sleep(MIN_WRITE_INTERVAL_MS - elapsed);
+}
+
+function shouldRetryRateLimit(response: Response): boolean {
+  if (response.status !== 403 && response.status !== 429) return false;
+  if (response.headers.get("retry-after") != null) return true;
+  return response.headers.get("x-ratelimit-remaining") === "0";
+}
+
+async function githubFetch(
+  url: string,
+  method: HttpMethod,
+  headers: Record<string, string>,
+  body: string | undefined,
+): Promise<Response> {
+  for (let attempt = 0; ; attempt++) {
+    await waitForPrimaryRateLimit();
+    await waitForWriteSpacing(method);
+
+    const response = await fetch(url, { method, headers, body });
+    updateRateLimitFromHeaders(response.headers);
+    if (isWriteMethod(method)) lastWriteAt = Date.now();
+
+    if (!shouldRetryRateLimit(response)) return response;
+    if (attempt >= MAX_RATE_LIMIT_RETRIES) return response;
+
+    const retryAfterMs = parseRetryAfterMs(response.headers) ?? 0;
+    const backoffMs = 1000 * 2 ** attempt;
+    const waitMs = Math.min(MAX_RATE_LIMIT_WAIT_MS, Math.max(retryAfterMs, backoffMs));
+    await sleep(waitMs + 250);
+  }
+}
+
 async function githubApi<T>(pi: ExtensionAPI, path: string, init: ApiRequestInit = {}): Promise<T> {
   const headers = await buildAuthHeaders(pi);
   const url = path.startsWith("http") ? path : `${GITHUB_API_BASE}${path}`;
   const method = init.method ?? "GET";
   if (init.body != null) headers["Content-Type"] = "application/json";
+  const body = init.body != null ? JSON.stringify(init.body) : undefined;
 
-  const response = await fetch(url, {
-    method,
-    headers,
-    body: init.body != null ? JSON.stringify(init.body) : undefined,
-  });
+  const response = await githubFetch(url, method, headers, body);
 
   if (!response.ok) {
     throw new Error(`GitHub API ${method} ${path} failed: ${await readErrorDetail(response)}`);
@@ -134,7 +231,7 @@ async function githubApiPaginate<T>(pi: ExtensionAPI, path: string): Promise<T[]
   const collected: T[] = [];
   let url: string | null = initialUrl;
   while (url != null) {
-    const response = await fetch(url, { headers });
+    const response = await githubFetch(url, "GET", headers, undefined);
     if (!response.ok) {
       throw new Error(`GitHub API GET ${path} failed: ${await readErrorDetail(response)}`);
     }
