@@ -22,7 +22,9 @@ The command:
 6. fetches existing PR review comments via the GitHub REST API and renders them inline as threads (matching GitHub's location, side, and reply structure). Outdated and file-level threads are surfaced in the file header strip
 7. lets you reply to existing threads — posts to `POST /repos/{o}/{r}/pulls/{N}/comments/{id}/replies` and appends to the thread
 8. lets you draft comments on the base side, head side, or whole file. For inline drafts, a **Post comment** button (or Cmd/Ctrl+Enter) posts the comment directly to GitHub via `POST /repos/{o}/{r}/pulls/{N}/comments`; otherwise the draft falls through to the prompt on Finish review
-9. inserts the resulting feedback prompt (including PR title and URL) into the pi editor when you submit, using any drafts that were not posted to GitHub
+9. supports per-file controls: mark file reviewed, toggle word wrap, hide unchanged regions in the diff, and add file-level / overall PR notes
+10. supports zoom — Cmd/Ctrl + `+`/`-`/`0` and Cmd/Ctrl + scroll wheel adjust UI scale (default 1.2×, persisted in `localStorage`)
+11. inserts the resulting feedback prompt (including PR title and URL) into the pi editor when you submit, using any drafts that were not posted to GitHub
 
 ## Usage
 
