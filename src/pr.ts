@@ -9,6 +9,7 @@ import {
   ensureGitHubAuth,
   fetchPullRequestReviewThreads,
   fetchPullRequestView,
+  getViewerLogin,
   parseGitRemoteUrl,
   type PullRequestView,
   runCli,
@@ -333,8 +334,9 @@ export async function getReviewWindowData(pi: ExtensionAPI, prepared: PreparedPu
     number: info.number,
   });
   const orphanThreads = attachThreadsToFiles(files, threads);
+  const viewerLogin = await getViewerLogin(pi);
 
-  return { pr: info, workDir, files, orphanThreads };
+  return { pr: info, workDir, files, orphanThreads, viewerLogin };
 }
 
 export async function loadReviewFileContents(

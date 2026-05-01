@@ -19,7 +19,14 @@ const state = {
   postErrors: {},
   replyDrafts: {},
   pendingReplies: {},
+  replyDraftOpen: {},
+  editDrafts: {},
+  editDraftOpen: {},
+  pendingEdits: {},
+  pendingDeletes: {},
 };
+
+const viewerLogin = reviewData.viewerLogin || null;
 
 const sidebarEl = document.getElementById("sidebar");
 const sidebarTitleEl = document.getElementById("sidebar-title");
@@ -42,6 +49,9 @@ const fileCommentButton = document.getElementById("file-comment-button");
 const toggleReviewedButton = document.getElementById("toggle-reviewed-button");
 const toggleUnchangedButton = document.getElementById("toggle-unchanged-button");
 const toggleWrapButton = document.getElementById("toggle-wrap-button");
+const prevChangeButton = document.getElementById("prev-change-button");
+const nextChangeButton = document.getElementById("next-change-button");
+const changeNavGroup = document.getElementById("change-nav-group");
 
 const pr = reviewData.pr || {};
 windowTitleEl.textContent = pr.number != null ? `PR #${pr.number} — ${pr.title || ""}` : "Review";
@@ -381,11 +391,12 @@ function ensureFileLoaded(fileId, scope = state.currentScope) {
   }
 }
 
-function openFile(fileId) {
+function openFile(fileId, options = {}) {
   if (state.activeFileId === fileId) {
     ensureFileLoaded(fileId, state.currentScope);
     return;
   }
+  if (!options.preservePendingJump) pendingChangeJump = null;
   saveCurrentScrollPosition();
   state.activeFileId = fileId;
   renderAll({ restoreFileScroll: true });
@@ -551,6 +562,8 @@ function updateToggleButtons() {
   toggleWrapButton.textContent = `Wrap lines: ${state.wrapLines ? "on" : "off"}`;
   toggleUnchangedButton.textContent = state.hideUnchanged ? "Show full file" : "Show changed areas only";
   toggleUnchangedButton.style.display = activeFileShowsDiff() ? "inline-flex" : "none";
+  changeNavGroup.style.display = activeFileShowsDiff() ? "inline-flex" : "none";
+  updateChangeNavButtons();
   updateScopeButtons();
   modeHintEl.textContent = scopeHint(state.currentScope);
   submitButton.disabled = false;
@@ -696,24 +709,69 @@ function buildThreadCommentMarkup(comment) {
   const initial = (comment.author?.login || "?").charAt(0).toUpperCase();
   const avatarSrc = comment.author?.avatarUrl ? `<img src="${escapeAttr(comment.author.avatarUrl)}" alt="${escapeAttr(comment.author.login || "")}">` : escapeHtml(initial);
   const relative = formatRelativeTime(comment.createdAt);
-  const timestamp = relative ? `<span title="${escapeAttr(comment.createdAt)}">${escapeHtml(relative)}</span>` : "";
+  const edited = comment.updatedAt && comment.updatedAt !== comment.createdAt;
+  const timestamp = relative
+    ? `<span title="${escapeAttr(comment.createdAt)}">${escapeHtml(relative)}${edited ? " (edited)" : ""}</span>`
+    : edited ? `<span>(edited)</span>` : "";
   const link = comment.htmlUrl ? `<a href="${escapeAttr(comment.htmlUrl)}" target="_blank" rel="noopener noreferrer" style="color:#8b949e;">view</a>` : "";
   const sep = timestamp && link ? "·" : "";
+  const author = comment.author?.login || "unknown";
+  const isOwn = viewerLogin != null && comment.author?.login === viewerLogin;
+  const isEditing = state.editDraftOpen[comment.id] === true;
+  const editPending = state.pendingEdits[comment.id] === true;
+  const deletePending = state.pendingDeletes[comment.id] === true;
+  const editError = state.postErrors[`edit:${comment.id}`] || "";
+  const deleteError = state.postErrors[`delete:${comment.id}`] || "";
+  const draft = state.editDrafts[comment.id] ?? comment.body ?? "";
+
+  const bodyMarkup = isEditing
+    ? `
+        <textarea data-action="edit-input" data-comment-id="${comment.id}" data-thread-id="${comment.threadId}" class="scrollbar-thin min-h-[60px] w-full resize-y rounded-md border border-review-border bg-[#010409] px-3 py-2 text-xs text-review-text outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500">${escapeHtml(draft)}</textarea>
+        ${editError ? `<div style="margin-top:6px;padding:6px 8px;border-radius:6px;background:rgba(248,81,73,0.1);border:1px solid rgba(248,81,73,0.3);color:#ffa198;font-size:11px;">${escapeHtml(editError)}</div>` : ""}
+        <div style="margin-top:6px;display:flex;justify-content:flex-end;gap:6px;">
+          <button data-action="cancel-edit" data-comment-id="${comment.id}" class="cursor-pointer rounded-md border border-review-border bg-review-panel px-3 py-1 text-xs font-medium text-review-text hover:bg-[#21262d]">Cancel</button>
+          <button data-action="save-edit" data-comment-id="${comment.id}" data-thread-id="${comment.threadId}" ${editPending ? "disabled" : ""} class="cursor-pointer rounded-md border border-[rgba(240,246,252,0.1)] bg-[#238636] px-3 py-1 text-xs font-medium text-white hover:bg-[#2ea043] disabled:cursor-default disabled:opacity-60">${editPending ? "Saving…" : "Save"}</button>
+        </div>
+      `
+    : `<div class="gh-thread-body-text">${renderInlineMarkdown(comment.body || "")}</div>`;
+
+  const ownerActions = isOwn && !isEditing
+    ? `
+        <div class="gh-comment-actions">
+          <button data-action="open-edit" data-comment-id="${comment.id}" data-initial-body="${escapeAttr(comment.body || "")}" class="gh-comment-icon-btn" title="Edit comment" aria-label="Edit comment">
+            ${ICON_PENCIL_SVG}
+          </button>
+          <button data-action="delete-comment" data-comment-id="${comment.id}" data-thread-id="${comment.threadId}" ${deletePending ? "disabled" : ""} class="gh-comment-icon-btn gh-comment-icon-danger" title="Delete comment" aria-label="Delete comment">
+            ${deletePending ? ICON_SPINNER_SVG : ICON_TRASH_SVG}
+          </button>
+        </div>
+      `
+    : "";
+  const deleteErrorMarkup = deleteError
+    ? `<div style="margin-top:4px;padding:6px 8px;border-radius:6px;background:rgba(248,81,73,0.1);border:1px solid rgba(248,81,73,0.3);color:#ffa198;font-size:11px;">${escapeHtml(deleteError)}</div>`
+    : "";
+
   return `
-    <div class="gh-thread-comment">
+    <div class="gh-thread-comment" data-comment-id="${comment.id}">
       <div class="gh-thread-avatar">${avatarSrc}</div>
       <div class="gh-thread-body">
         <div class="gh-thread-body-header">
-          <span class="gh-thread-author">${escapeHtml(comment.author?.login || "unknown")}</span>
+          <span class="gh-thread-author">${escapeHtml(author)}</span>
           ${timestamp}
           ${sep ? `<span>${sep}</span>` : ""}
           ${link}
         </div>
-        <div class="gh-thread-body-text">${renderInlineMarkdown(comment.body || "")}</div>
+        ${bodyMarkup}
+        ${deleteErrorMarkup}
       </div>
+      ${ownerActions}
     </div>
   `;
 }
+
+const ICON_PENCIL_SVG = `<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M11.013 1.427a1.75 1.75 0 0 1 2.474 0l1.086 1.086a1.75 1.75 0 0 1 0 2.474l-8.61 8.61c-.21.21-.47.364-.756.445l-3.251.93a.75.75 0 0 1-.927-.928l.929-3.25c.081-.286.235-.547.445-.758l8.61-8.61Zm.176 4.823L9.75 4.81l-6.286 6.287a.253.253 0 0 0-.064.108l-.558 1.953 1.953-.558a.253.253 0 0 0 .108-.064Zm1.238-3.763a.25.25 0 0 0-.354 0L10.811 3.75l1.439 1.44 1.263-1.263a.25.25 0 0 0 0-.354Z"/></svg>`;
+const ICON_TRASH_SVG = `<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M11 1.75V3h2.25a.75.75 0 0 1 0 1.5H2.75a.75.75 0 0 1 0-1.5H5V1.75C5 .784 5.784 0 6.75 0h2.5C10.216 0 11 .784 11 1.75ZM4.496 6.675l.66 6.6a.25.25 0 0 0 .249.225h5.19a.25.25 0 0 0 .249-.225l.66-6.6a.75.75 0 0 1 1.492.149l-.66 6.6A1.748 1.748 0 0 1 10.595 15h-5.19a1.75 1.75 0 0 1-1.741-1.575l-.66-6.6a.75.75 0 1 1 1.492-.15ZM6.5 1.75V3h3V1.75a.25.25 0 0 0-.25-.25h-2.5a.25.25 0 0 0-.25.25Z"/></svg>`;
+const ICON_SPINNER_SVG = `<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true" class="gh-spin"><circle cx="8" cy="8" r="6" opacity="0.25"/><path d="M14 8a6 6 0 0 0-6-6" stroke-linecap="round"/></svg>`;
 
 function buildThreadHeaderMarkup(thread) {
   const sideLabel = thread.side === "base" ? "base" : "head";
@@ -776,48 +834,153 @@ function renderThreadDOM(thread) {
   return container;
 }
 
-function attachThreadHandlers(container, thread) {
-  const openBtn = container.querySelector("[data-action='open-reply']");
-  if (openBtn) {
-    openBtn.addEventListener("click", () => {
-      state.replyDraftOpen = state.replyDraftOpen || {};
-      state.replyDraftOpen[thread.id] = true;
-      state.replyDrafts[thread.id] = state.replyDrafts[thread.id] ?? "";
+function numAttr(el, name) {
+  const value = el?.getAttribute(name);
+  return value == null ? null : Number(value);
+}
+
+function focusAtEnd(input) {
+  setTimeout(() => {
+    input.focus();
+    const len = input.value.length;
+    try { input.setSelectionRange(len, len); } catch { /* ignore */ }
+  }, 30);
+}
+
+function attachReplyInput(container, thread, input) {
+  input.addEventListener("input", () => {
+    state.replyDrafts[thread.id] = input.value;
+    if (state.postErrors[`reply:${thread.id}`]) {
+      delete state.postErrors[`reply:${thread.id}`];
+      const err = container.querySelector(".gh-thread-reply div[style*='ffa198']");
+      if (err) err.remove();
+    }
+  });
+  input.addEventListener("keydown", (event) => {
+    if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+      event.preventDefault();
+      postReply(thread.id);
+    }
+  });
+  setTimeout(() => input.focus(), 30);
+}
+
+function attachEditInput(input) {
+  const commentId = numAttr(input, "data-comment-id");
+  const threadId = numAttr(input, "data-thread-id");
+  input.addEventListener("input", () => {
+    state.editDrafts[commentId] = input.value;
+    delete state.postErrors[`edit:${commentId}`];
+  });
+  input.addEventListener("keydown", (event) => {
+    if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+      event.preventDefault();
+      saveEdit(threadId, commentId);
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      state.editDraftOpen[commentId] = false;
+      delete state.editDrafts[commentId];
       updateCommentsUI();
-    });
-  }
-  const cancelBtn = container.querySelector("[data-action='cancel-reply']");
-  if (cancelBtn) {
-    cancelBtn.addEventListener("click", () => {
-      state.replyDraftOpen = state.replyDraftOpen || {};
+    }
+  });
+  focusAtEnd(input);
+}
+
+function handleThreadClick(thread, target) {
+  const action = target.getAttribute("data-action");
+  const commentId = numAttr(target, "data-comment-id");
+  const threadId = numAttr(target, "data-thread-id") ?? thread.id;
+  switch (action) {
+    case "open-reply":
+      state.replyDraftOpen[thread.id] = true;
+      state.replyDrafts[thread.id] ??= "";
+      updateCommentsUI();
+      return;
+    case "cancel-reply":
       state.replyDraftOpen[thread.id] = false;
       delete state.replyDrafts[thread.id];
       delete state.postErrors[`reply:${thread.id}`];
       updateCommentsUI();
+      return;
+    case "post-reply":
+      postReply(thread.id);
+      return;
+    case "open-edit":
+      state.editDraftOpen[commentId] = true;
+      state.editDrafts[commentId] = target.getAttribute("data-initial-body") || "";
+      delete state.postErrors[`edit:${commentId}`];
+      updateCommentsUI();
+      return;
+    case "cancel-edit":
+      state.editDraftOpen[commentId] = false;
+      delete state.editDrafts[commentId];
+      delete state.postErrors[`edit:${commentId}`];
+      updateCommentsUI();
+      return;
+    case "save-edit":
+      saveEdit(threadId, commentId);
+      return;
+    case "delete-comment":
+      requestDelete(threadId, commentId);
+      return;
+  }
+}
+
+function attachThreadHandlers(container, thread) {
+  container.addEventListener("click", (event) => {
+    const target = event.target.closest("[data-action]");
+    if (target && container.contains(target)) handleThreadClick(thread, target);
+  });
+
+  const replyInput = container.querySelector("[data-action='reply-input']");
+  if (replyInput) attachReplyInput(container, thread, replyInput);
+
+  container.querySelectorAll("[data-action='edit-input']").forEach(attachEditInput);
+}
+
+function saveEdit(threadId, commentId) {
+  const body = String(state.editDrafts[commentId] ?? "").trim();
+  if (body.length === 0) {
+    state.postErrors[`edit:${commentId}`] = "Comment body cannot be empty.";
+    updateCommentsUI();
+    return;
+  }
+  if (state.pendingEdits[commentId]) return;
+  const fileId = findFileIdForThread(threadId) || "";
+  state.pendingEdits[commentId] = true;
+  delete state.postErrors[`edit:${commentId}`];
+  if (window.glimpse?.send) {
+    window.glimpse.send({
+      type: "edit-comment",
+      clientId: `edit:${commentId}`,
+      fileId,
+      threadId,
+      commentId,
+      body,
     });
   }
-  const postBtn = container.querySelector("[data-action='post-reply']");
-  if (postBtn) {
-    postBtn.addEventListener("click", () => postReply(thread.id));
-  }
-  const input = container.querySelector("[data-action='reply-input']");
-  if (input) {
-    input.addEventListener("input", () => {
-      state.replyDrafts[thread.id] = input.value;
-      if (state.postErrors[`reply:${thread.id}`]) {
-        delete state.postErrors[`reply:${thread.id}`];
-        const err = container.querySelector(".gh-thread-reply div[style*='ffa198']");
-        if (err) err.remove();
-      }
+  updateCommentsUI();
+}
+
+function requestDelete(threadId, commentId) {
+  if (state.pendingDeletes[commentId]) return;
+  const confirmed = window.confirm("Delete this comment? This cannot be undone.");
+  if (!confirmed) return;
+  const fileId = findFileIdForThread(threadId) || "";
+  state.pendingDeletes[commentId] = true;
+  delete state.postErrors[`delete:${commentId}`];
+  if (window.glimpse?.send) {
+    window.glimpse.send({
+      type: "delete-comment",
+      clientId: `delete:${commentId}`,
+      fileId,
+      threadId,
+      commentId,
     });
-    input.addEventListener("keydown", (event) => {
-      if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
-        event.preventDefault();
-        postReply(thread.id);
-      }
-    });
-    setTimeout(() => input.focus(), 30);
   }
+  updateCommentsUI();
 }
 
 function estimateThreadHeight(thread) {
@@ -847,9 +1010,13 @@ function canPostInline(comment) {
 function renderCommentDOM(comment, onDelete) {
   const container = document.createElement("div");
   container.className = "view-zone-container";
+  const sideLabel = comment.side === "original" ? "Base" : "Head";
+  const lineLabel = comment.endLine != null && comment.endLine !== comment.startLine
+    ? `lines ${comment.startLine}–${comment.endLine}`
+    : `line ${comment.startLine}`;
   const title = comment.side === "file"
     ? `File comment • ${scopeLabel(comment.scope)}`
-    : `${comment.side === "original" ? "Base" : "Head"} line ${comment.startLine} • ${scopeLabel(comment.scope)}`;
+    : `${sideLabel} ${lineLabel} • ${scopeLabel(comment.scope)}`;
 
   const postable = canPostInline(comment);
   const pending = state.pendingPosts[comment.id] === true;
@@ -903,13 +1070,17 @@ function postInlineDraft(comment) {
   }
   state.pendingPosts[comment.id] = true;
   delete state.postErrors[comment.id];
+  const endLine = comment.endLine ?? comment.startLine;
+  const startLine = Math.min(comment.startLine, endLine);
+  const finalEnd = Math.max(comment.startLine, endLine);
   if (window.glimpse?.send) {
     window.glimpse.send({
       type: "post-comment",
       clientId: comment.id,
       fileId: comment.fileId,
       side: comment.side === "original" ? "base" : "head",
-      line: comment.startLine,
+      line: finalEnd,
+      startLine: startLine !== finalEnd ? startLine : null,
       body,
     });
   }
@@ -994,7 +1165,7 @@ function syncViewZones() {
     editor.changeViewZones((accessor) => {
       const lineCount = typeof item.body === "string" && item.body.length > 0 ? item.body.split("\n").length : 1;
       const id = accessor.addZone({
-        afterLineNumber: item.startLine,
+        afterLineNumber: item.endLine ?? item.startLine,
         heightInPx: Math.max(150, lineCount * 22 + 86),
         domNode,
       });
@@ -1006,10 +1177,17 @@ function syncViewZones() {
   inlineThreads.forEach((thread) => {
     const editor = thread.side === "base" ? originalEditor : modifiedEditor;
     const domNode = renderThreadDOM(thread);
+    const heightInPx = estimateThreadHeight(thread);
+    // Constrain the thread to the view-zone height and let it scroll internally
+    // so the Reply button stays reachable when markdown content overflows.
+    const innerMaxHeight = Math.max(40, heightInPx - 14); // 14 = .gh-thread top+bottom margin
+    domNode.style.maxHeight = `${innerMaxHeight}px`;
+    domNode.style.overflow = "auto";
+    domNode.classList.add("scrollbar-thin");
     editor.changeViewZones((accessor) => {
       const id = accessor.addZone({
         afterLineNumber: thread.line,
-        heightInPx: estimateThreadHeight(thread),
+        heightInPx,
         domNode,
       });
       activeViewZones.push({ id, editor });
@@ -1025,8 +1203,10 @@ function updateDecorations() {
   const modifiedRanges = [];
 
   for (const comment of comments) {
+    const startLine = comment.startLine;
+    const endLine = comment.endLine ?? comment.startLine;
     const range = {
-      range: new monacoApi.Range(comment.startLine, 1, comment.startLine, 1),
+      range: new monacoApi.Range(startLine, 1, endLine, 1),
       options: {
         isWholeLine: true,
         className: comment.side === "original" ? "review-comment-line-original" : "review-comment-line-modified",
@@ -1190,34 +1370,74 @@ function renderAll(options = {}) {
 
 function createGlyphHoverActions(editor, side) {
   let hoverDecoration = [];
+  let dragRangeDecoration = [];
+  let dragStartLine = null;
+  let dragCurrentLine = null;
 
-  function openDraftAtLine(line) {
+  const T = monacoApi.editor.MouseTargetType;
+  const isGutterTarget = (target) =>
+    target?.type === T.GUTTER_GLYPH_MARGIN ||
+    target?.type === T.GUTTER_LINE_NUMBERS ||
+    target?.type === T.GUTTER_LINE_DECORATIONS;
+  const isLineTarget = (target) =>
+    isGutterTarget(target) ||
+    target?.type === T.CONTENT_TEXT ||
+    target?.type === T.CONTENT_EMPTY;
+
+  const canEdit = () => {
+    const file = activeFile();
+    return !!file && canCommentOnSide(file, side) && isActiveFileReady();
+  };
+
+  function openDraftRange(startLine, endLine) {
     const file = activeFile();
     if (!file || !canCommentOnSide(file, side) || !isActiveFileReady()) return;
+    const lo = Math.min(startLine, endLine);
+    const hi = Math.max(startLine, endLine);
     state.comments.push({
       id: `${Date.now()}:${Math.random().toString(16).slice(2)}`,
       fileId: file.id,
       scope: state.currentScope,
       side,
-      startLine: line,
-      endLine: line,
+      startLine: lo,
+      endLine: hi,
       body: "",
     });
     updateCommentsUI();
-    editor.revealLineInCenter(line);
+    editor.revealLineInCenter(hi);
+  }
+
+  function clearDragRange() {
+    dragRangeDecoration = editor.deltaDecorations(dragRangeDecoration, []);
+  }
+
+  function showDragRange(start, end) {
+    const lo = Math.min(start, end);
+    const hi = Math.max(start, end);
+    dragRangeDecoration = editor.deltaDecorations(dragRangeDecoration, [{
+      range: new monacoApi.Range(lo, 1, hi, 1),
+      options: {
+        isWholeLine: true,
+        className: "review-pending-range",
+      },
+    }]);
   }
 
   editor.onMouseMove((event) => {
-    const file = activeFile();
-    if (!file || !canCommentOnSide(file, side) || !isActiveFileReady()) {
+    if (!canEdit()) {
       hoverDecoration = editor.deltaDecorations(hoverDecoration, []);
       return;
     }
-
     const target = event.target;
-    if (target.type === monacoApi.editor.MouseTargetType.GUTTER_GLYPH_MARGIN || target.type === monacoApi.editor.MouseTargetType.GUTTER_LINE_NUMBERS) {
-      const line = target.position?.lineNumber;
-      if (!line) return;
+    const line = target.position?.lineNumber;
+    if (dragStartLine != null && line != null) {
+      // Active gutter drag — paint the candidate range, hide the + glyph hint.
+      hoverDecoration = editor.deltaDecorations(hoverDecoration, []);
+      dragCurrentLine = line;
+      showDragRange(dragStartLine, line);
+      return;
+    }
+    if (isLineTarget(target) && line != null) {
       hoverDecoration = editor.deltaDecorations(hoverDecoration, [{
         range: new monacoApi.Range(line, 1, line, 1),
         options: { glyphMarginClassName: "review-glyph-plus" },
@@ -1232,15 +1452,37 @@ function createGlyphHoverActions(editor, side) {
   });
 
   editor.onMouseDown((event) => {
-    const file = activeFile();
-    if (!file || !canCommentOnSide(file, side) || !isActiveFileReady()) return;
-
+    if (!canEdit()) return;
     const target = event.target;
-    if (target.type === monacoApi.editor.MouseTargetType.GUTTER_GLYPH_MARGIN || target.type === monacoApi.editor.MouseTargetType.GUTTER_LINE_NUMBERS) {
-      const line = target.position?.lineNumber;
-      if (!line) return;
-      openDraftAtLine(line);
-    }
+    if (!isGutterTarget(target)) return;
+    const line = target.position?.lineNumber;
+    if (line == null) return;
+    dragStartLine = line;
+    dragCurrentLine = line;
+    hoverDecoration = editor.deltaDecorations(hoverDecoration, []);
+    showDragRange(line, line);
+  });
+
+  // Monaco suspends its onMouseMove while the mouse is pressed, so we listen
+  // at the document level and translate client coords back to a line via
+  // getTargetAtClientPoint. Same goes for mouseup which Monaco may swallow.
+  document.addEventListener("mousemove", (event) => {
+    if (dragStartLine == null) return;
+    const target = editor.getTargetAtClientPoint(event.clientX, event.clientY);
+    const line = target?.position?.lineNumber;
+    if (line == null) return;
+    dragCurrentLine = line;
+    showDragRange(dragStartLine, line);
+  });
+
+  document.addEventListener("mouseup", () => {
+    if (dragStartLine == null) return;
+    const start = dragStartLine;
+    const end = dragCurrentLine ?? start;
+    dragStartLine = null;
+    dragCurrentLine = null;
+    clearDragRange();
+    if (canEdit()) openDraftRange(start, end);
   });
 }
 
@@ -1275,8 +1517,39 @@ window.__reviewReceive = function (message) {
       delete state.pendingReplies[threadId];
       delete state.postErrors[clientId];
       delete state.replyDrafts[threadId];
-      if (state.replyDraftOpen) state.replyDraftOpen[threadId] = false;
+      state.replyDraftOpen[threadId] = false;
     }
+    if (clientId && clientId.startsWith("edit:")) {
+      const commentId = Number(clientId.slice("edit:".length));
+      delete state.pendingEdits[commentId];
+      delete state.postErrors[clientId];
+      delete state.editDrafts[commentId];
+      state.editDraftOpen[commentId] = false;
+    }
+    const scrollState = captureScrollState();
+    updateCommentsUI();
+    if (scrollState) restoreScrollState(scrollState);
+    return;
+  }
+
+  if (message.type === "comment-deleted") {
+    const { fileId, threadId, commentId, clientId } = message;
+    const file = reviewData.files.find((f) => f.id === fileId);
+    const removeFromList = (list) => {
+      if (!list) return list;
+      const thread = list.find((t) => t.id === threadId);
+      if (!thread) return list;
+      thread.comments = (thread.comments || []).filter((c) => c.id !== commentId);
+      if (thread.comments.length === 0) return list.filter((t) => t.id !== threadId);
+      return list;
+    };
+    if (file) file.threads = removeFromList(file.threads);
+    reviewData.orphanThreads = removeFromList(reviewData.orphanThreads);
+    delete state.pendingDeletes[commentId];
+    delete state.editDraftOpen[commentId];
+    delete state.editDrafts[commentId];
+    delete state.pendingEdits[commentId];
+    if (clientId) delete state.postErrors[clientId];
     const scrollState = captureScrollState();
     updateCommentsUI();
     if (scrollState) restoreScrollState(scrollState);
@@ -1289,6 +1562,14 @@ window.__reviewReceive = function (message) {
       const threadId = Number(clientId.slice("reply:".length));
       delete state.pendingReplies[threadId];
       state.postErrors[clientId] = message.message || "Failed to post reply.";
+    } else if (clientId && clientId.startsWith("edit:")) {
+      const commentId = Number(clientId.slice("edit:".length));
+      delete state.pendingEdits[commentId];
+      state.postErrors[clientId] = message.message || "Failed to save edit.";
+    } else if (clientId && clientId.startsWith("delete:")) {
+      const commentId = Number(clientId.slice("delete:".length));
+      delete state.pendingDeletes[commentId];
+      state.postErrors[clientId] = message.message || "Failed to delete comment.";
     } else if (clientId) {
       delete state.pendingPosts[clientId];
       state.postErrors[clientId] = message.message || "Failed to post comment.";
@@ -1326,7 +1607,7 @@ window.__reviewReceive = function (message) {
 function setupMonaco() {
   window.require.config({
     paths: {
-      vs: "https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.52.2/min/vs",
+      vs: "https://cdn.jsdelivr.net/npm/monaco-editor@0.55.1/min/vs",
     },
   });
 
@@ -1365,6 +1646,14 @@ function setupMonaco() {
     createGlyphHoverActions(diffEditor.getOriginalEditor(), "original");
     createGlyphHoverActions(diffEditor.getModifiedEditor(), "modified");
 
+    diffEditor.onDidUpdateDiff(() => {
+      applyPendingChangeJump();
+      updateChangeNavButtons();
+    });
+    const onScrollChange = () => updateChangeNavButtons();
+    diffEditor.getOriginalEditor().onDidScrollChange(onScrollChange);
+    diffEditor.getModifiedEditor().onDidScrollChange(onScrollChange);
+
     if (typeof ResizeObserver !== "undefined") {
       editorResizeObserver = new ResizeObserver(() => {
         layoutEditor();
@@ -1380,6 +1669,158 @@ function setupMonaco() {
 
     mountFile();
   });
+}
+
+// --- Diff hunk navigation ---------------------------------------------
+
+const CHANGE_NAV_DOUBLE_CLICK_MS = 500;
+let pendingChangeJump = null; // "first" | "last" | null — applied after diff updates
+const stuckClickAt = { next: 0, prev: 0 };
+
+function getLineChanges() {
+  if (!diffEditor) return [];
+  return diffEditor.getLineChanges() || [];
+}
+
+function changeAnchorLine(change) {
+  // Use modified side when the change has any modified lines, original otherwise.
+  return change.modifiedEndLineNumber > 0
+    ? change.modifiedStartLineNumber
+    : change.originalStartLineNumber;
+}
+
+function getModifiedAnchorLine() {
+  if (!diffEditor) return 1;
+  const editor = diffEditor.getModifiedEditor();
+  const ranges = editor.getVisibleRanges();
+  if (ranges && ranges.length > 0) return ranges[0].startLineNumber;
+  return 1;
+}
+
+function revealChange(change) {
+  if (!diffEditor) return;
+  const isPureDeletion = change.modifiedEndLineNumber === 0;
+  const editor = isPureDeletion
+    ? diffEditor.getOriginalEditor()
+    : diffEditor.getModifiedEditor();
+  const line = isPureDeletion ? change.originalStartLineNumber : change.modifiedStartLineNumber;
+  editor.revealLineInCenter(line, monacoApi.editor.ScrollType.Smooth);
+  editor.setPosition({ lineNumber: line, column: 1 });
+}
+
+function cursorSnapshot() {
+  if (!diffEditor) return null;
+  return {
+    mod: diffEditor.getModifiedEditor().getPosition()?.lineNumber ?? null,
+    orig: diffEditor.getOriginalEditor().getPosition()?.lineNumber ?? null,
+  };
+}
+
+function jumpToChangeInFile(direction) {
+  if (!diffEditor || typeof diffEditor.goToDiff !== "function") return false;
+  const monacoTarget = direction === "next" ? "next" : "previous";
+  const before = cursorSnapshot();
+  diffEditor.goToDiff(monacoTarget);
+  const after = cursorSnapshot();
+  if (!before || !after) return true;
+  return before.mod !== after.mod || before.orig !== after.orig;
+}
+
+function getDiffFilesInScope() {
+  return getScopedFiles().filter((file) => file.prDiff != null);
+}
+
+function jumpToAdjacentDiffFile(direction) {
+  const files = getDiffFilesInScope();
+  if (files.length === 0) return false;
+  const idx = files.findIndex((f) => f.id === state.activeFileId);
+  const targetIdx = direction === "next"
+    ? (idx < 0 ? 0 : idx + 1)
+    : (idx < 0 ? files.length - 1 : idx - 1);
+  if (targetIdx < 0 || targetIdx >= files.length) return false;
+  const target = files[targetIdx];
+  pendingChangeJump = direction === "next" ? "first" : "last";
+  openFile(target.id, { preservePendingJump: true });
+  return true;
+}
+
+function applyPendingChangeJump() {
+  if (!pendingChangeJump || !diffEditor) return;
+  const changes = getLineChanges();
+  if (changes.length === 0) {
+    // Likely the placeholder "Loading..." content; wait for real file data.
+    updateChangeNavButtons();
+    return;
+  }
+  if (pendingChangeJump === "first") {
+    if (typeof diffEditor.revealFirstDiff === "function") {
+      diffEditor.revealFirstDiff();
+    } else {
+      revealChange(changes[0]);
+    }
+  } else {
+    revealChange(changes[changes.length - 1]);
+  }
+  pendingChangeJump = null;
+  updateChangeNavButtons();
+}
+
+function handleChangeNavClick(direction) {
+  if (state.currentScope !== "pr-diff") return;
+  if (jumpToChangeInFile(direction)) {
+    stuckClickAt[direction] = 0;
+    updateChangeNavButtons();
+    return;
+  }
+  // No further change in this file — a second click within the window jumps file.
+  const now = Date.now();
+  const lastStuck = stuckClickAt[direction];
+  if (lastStuck && now - lastStuck < CHANGE_NAV_DOUBLE_CLICK_MS) {
+    stuckClickAt[direction] = 0;
+    jumpToAdjacentDiffFile(direction);
+    return;
+  }
+  stuckClickAt[direction] = now;
+  flashButton(direction === "next" ? nextChangeButton : prevChangeButton);
+}
+
+function flashButton(button) {
+  if (!button) return;
+  button.classList.add("change-nav-flash");
+  setTimeout(() => button.classList.remove("change-nav-flash"), 220);
+}
+
+function updateChangeNavButtons() {
+  if (!prevChangeButton || !nextChangeButton) return;
+  if (state.currentScope !== "pr-diff" || !activeFileShowsDiff()) {
+    prevChangeButton.disabled = true;
+    nextChangeButton.disabled = true;
+    return;
+  }
+  const changes = getLineChanges();
+  const anchor = getModifiedAnchorLine();
+  const margin = 2;
+  // If we don't know the change list (null/[]), assume nav is possible —
+  // goToDiff() will be a no-op when there's nowhere to go.
+  const knowsChanges = changes.length > 0;
+  const hasNext = !knowsChanges || changes.some((c) => changeAnchorLine(c) > anchor + margin);
+  const hasPrev = !knowsChanges || changes.some((c) => changeAnchorLine(c) < anchor - margin);
+  const files = getDiffFilesInScope();
+  const idx = files.findIndex((f) => f.id === state.activeFileId);
+  const hasNextFile = idx >= 0 && idx < files.length - 1;
+  const hasPrevFile = idx > 0;
+  nextChangeButton.disabled = !hasNext && !hasNextFile;
+  prevChangeButton.disabled = !hasPrev && !hasPrevFile;
+  nextChangeButton.title = hasNext
+    ? "Next change"
+    : hasNextFile
+      ? "No more changes in this file — click again to jump to next file"
+      : "No more changes";
+  prevChangeButton.title = hasPrev
+    ? "Previous change"
+    : hasPrevFile
+      ? "At first change — click again to jump to previous file"
+      : "No previous changes";
 }
 
 function switchScope(scope) {
@@ -1444,6 +1885,9 @@ toggleReviewedButton.addEventListener("click", () => {
   state.reviewedFiles[file.id] = !isFileReviewed(file.id);
   renderTree();
 });
+
+prevChangeButton.addEventListener("click", () => handleChangeNavClick("prev"));
+nextChangeButton.addEventListener("click", () => handleChangeNavClick("next"));
 
 scopePrDiffButton.addEventListener("click", () => {
   switchScope("pr-diff");

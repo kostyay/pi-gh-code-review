@@ -96,6 +96,7 @@ export interface ReviewPostCommentPayload {
   fileId: string;
   side: PrCommentSide;
   line: number;
+  startLine?: number | null;
   body: string;
 }
 
@@ -107,12 +108,31 @@ export interface ReviewPostReplyPayload {
   body: string;
 }
 
+export interface ReviewEditCommentPayload {
+  type: "edit-comment";
+  clientId: string;
+  fileId: string;
+  threadId: number;
+  commentId: number;
+  body: string;
+}
+
+export interface ReviewDeleteCommentPayload {
+  type: "delete-comment";
+  clientId: string;
+  fileId: string;
+  threadId: number;
+  commentId: number;
+}
+
 export type ReviewWindowMessage =
   | ReviewSubmitPayload
   | ReviewCancelPayload
   | ReviewRequestFilePayload
   | ReviewPostCommentPayload
-  | ReviewPostReplyPayload;
+  | ReviewPostReplyPayload
+  | ReviewEditCommentPayload
+  | ReviewDeleteCommentPayload;
 
 export interface ReviewFileDataMessage {
   type: "file-data";
@@ -144,11 +164,20 @@ export interface ReviewPostErrorMessage {
   message: string;
 }
 
+export interface ReviewCommentDeletedMessage {
+  type: "comment-deleted";
+  clientId: string;
+  fileId: string;
+  threadId: number;
+  commentId: number;
+}
+
 export type ReviewHostMessage =
   | ReviewFileDataMessage
   | ReviewFileErrorMessage
   | ReviewThreadUpdatedMessage
-  | ReviewPostErrorMessage;
+  | ReviewPostErrorMessage
+  | ReviewCommentDeletedMessage;
 
 export interface PullRequestInfo {
   url: string;
@@ -172,6 +201,7 @@ export interface ReviewWindowData {
   workDir: string;
   files: ReviewFile[];
   orphanThreads: PrReviewThread[];
+  viewerLogin: string | null;
 }
 
 export interface PullRequestSummary {

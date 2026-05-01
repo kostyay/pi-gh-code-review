@@ -2,6 +2,8 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-cod
 import { fuzzyFilter, Key, matchesKey, truncateToWidth } from "@mariozechner/pi-tui";
 import { open, type GlimpseWindow } from "glimpseui";
 import {
+  deleteReviewComment,
+  editReviewComment,
   getCurrentBranchPullRequestUrl,
   listOpenPullRequests,
   postCommentReply,
@@ -19,6 +21,8 @@ import type {
   PullRequestRef,
   PullRequestSummary,
   ReviewCancelPayload,
+  ReviewDeleteCommentPayload,
+  ReviewEditCommentPayload,
   ReviewFile,
   ReviewFileContents,
   ReviewHostMessage,
@@ -378,6 +382,7 @@ export default function (pi: ExtensionAPI) {
           path,
           side: message.side,
           line: message.line,
+          startLine: message.startLine ?? null,
           body: message.body,
           commitSha: data.pr.headRefOid,
         });
@@ -402,6 +407,52 @@ export default function (pi: ExtensionAPI) {
           clientId: message.clientId,
           fileId: file?.id ?? message.fileId,
           thread,
+        });
+      } catch (error) {
+        sendPostError(message.clientId, error);
+      }
+    };
+
+    const handleEditComment = async (message: ReviewEditCommentPayload): Promise<void> => {
+      const { file, thread } = findThreadOwner(message.threadId);
+      if (thread == null) {
+        sendWindowMessage({ type: "post-error", clientId: message.clientId, message: "Thread not found." });
+        return;
+      }
+      try {
+        const updated = await editReviewComment(pi, prRef, message.threadId, message.commentId, message.body);
+        const idx = thread.comments.findIndex((c) => c.id === message.commentId);
+        if (idx >= 0) thread.comments[idx] = updated;
+        sendWindowMessage({
+          type: "thread-updated",
+          clientId: message.clientId,
+          fileId: file?.id ?? message.fileId,
+          thread,
+        });
+      } catch (error) {
+        sendPostError(message.clientId, error);
+      }
+    };
+
+    const handleDeleteComment = async (message: ReviewDeleteCommentPayload): Promise<void> => {
+      const { file, thread } = findThreadOwner(message.threadId);
+      if (thread == null) {
+        sendWindowMessage({ type: "post-error", clientId: message.clientId, message: "Thread not found." });
+        return;
+      }
+      try {
+        await deleteReviewComment(pi, prRef, message.commentId);
+        thread.comments = thread.comments.filter((c) => c.id !== message.commentId);
+        if (thread.comments.length === 0) {
+          if (file != null) file.threads = file.threads.filter((t) => t.id !== thread.id);
+          else data.orphanThreads = data.orphanThreads.filter((t) => t.id !== thread.id);
+        }
+        sendWindowMessage({
+          type: "comment-deleted",
+          clientId: message.clientId,
+          fileId: file?.id ?? message.fileId,
+          threadId: thread.id,
+          commentId: message.commentId,
         });
       } catch (error) {
         sendPostError(message.clientId, error);
@@ -441,6 +492,12 @@ export default function (pi: ExtensionAPI) {
               return;
             case "post-reply":
               void handlePostReply(message);
+              return;
+            case "edit-comment":
+              void handleEditComment(message);
+              return;
+            case "delete-comment":
+              void handleDeleteComment(message);
               return;
             case "submit":
             case "cancel":
