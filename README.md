@@ -34,6 +34,41 @@ The command:
 /pr-review owner/repo#42
 ```
 
+## Inline commenting
+
+- **Single line** — click the line number in the gutter (or the `+` icon that appears on hover).
+- **Range** — click and drag down or up across line numbers; release to open the comment form below the last selected line. Same gesture as on github.com.
+- **Edit / delete** — hover any of your own posted comments to reveal the pencil and trash icons in the top-right of the comment row.
+- **Reply** — use the `Reply` button at the bottom of any existing thread.
+- Code-text clicks are reserved for Monaco's text selection — they intentionally do not start a comment.
+
+## Development & debugging
+
+The review UI is a single inlined HTML+JS bundle (`web/index.html` + `web/app.js`) that's embedded into the Glimpse WebView at runtime. To debug it without spinning up pi or hitting GitHub, the repo ships a standalone test harness:
+
+```
+node scripts/serve-test.mjs            # serves the review page on http://localhost:5173
+```
+
+The harness:
+
+- re-reads `web/index.html` and `web/app.js` on every request (no restart needed when iterating)
+- injects mock `ReviewWindowData` (one file, two diffs) and stubs `window.glimpse.send` / `close` so messages are captured on `window.__sentMessages` instead of being sent to a host
+- pre-seeds `state.fileContents` so the diff editor mounts immediately
+
+Drive it with `agent-browser` / Playwright for headless interaction tests, e.g.:
+
+```
+agent-browser open http://localhost:5173/
+agent-browser eval "diffEditor.getModifiedEditor().getDomNode().querySelectorAll('.line-numbers')[4].getBoundingClientRect()"
+agent-browser mouse move <x> <y>
+agent-browser mouse down left
+agent-browser mouse up left
+agent-browser eval "JSON.stringify(state.comments)"
+```
+
+This is the fastest way to repro and verify Monaco gutter / view-zone / decoration behaviour, since glimpseui's WebView does not expose devtools.
+
 ## Requirements
 
 - macOS, Linux, or Windows

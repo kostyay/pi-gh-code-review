@@ -316,6 +316,7 @@ export interface PostLineCommentInput {
   path: string;
   side: PrCommentSide;
   line: number;
+  startLine?: number | null;
   body: string;
   commitSha: string;
 }
@@ -522,19 +523,22 @@ export async function postLineComment(
   ref: PullRequestRef,
   input: PostLineCommentInput,
 ): Promise<PrReviewThread> {
+  const sideValue = sideToGitHubValue(input.side);
+  const body: Record<string, unknown> = {
+    body: input.body,
+    commit_id: input.commitSha,
+    path: input.path,
+    line: input.line,
+    side: sideValue,
+  };
+  if (input.startLine != null && input.startLine !== input.line) {
+    body.start_line = input.startLine;
+    body.start_side = sideValue;
+  }
   const raw = await githubApi<RawReviewComment>(
     pi,
     `/repos/${ref.owner}/${ref.repo}/pulls/${ref.number}/comments`,
-    {
-      method: "POST",
-      body: {
-        body: input.body,
-        commit_id: input.commitSha,
-        path: input.path,
-        line: input.line,
-        side: sideToGitHubValue(input.side),
-      },
-    },
+    { method: "POST", body },
   );
   return createThreadFromRoot(raw, raw.id);
 }
@@ -551,4 +555,40 @@ export async function postCommentReply(
     { method: "POST", body: { body } },
   );
   return toReviewComment(raw, rootCommentId);
+}
+
+export async function editReviewComment(
+  pi: ExtensionAPI,
+  ref: PullRequestRef,
+  threadId: number,
+  commentId: number,
+  body: string,
+): Promise<PrReviewComment> {
+  const raw = await githubApi<RawReviewComment>(
+    pi,
+    `/repos/${ref.owner}/${ref.repo}/pulls/comments/${commentId}`,
+    { method: "PATCH", body: { body } },
+  );
+  return toReviewComment(raw, threadId);
+}
+
+export async function deleteReviewComment(
+  pi: ExtensionAPI,
+  ref: PullRequestRef,
+  commentId: number,
+): Promise<void> {
+  await githubApi<void>(
+    pi,
+    `/repos/${ref.owner}/${ref.repo}/pulls/comments/${commentId}`,
+    { method: "DELETE" },
+  );
+}
+
+export async function getViewerLogin(pi: ExtensionAPI): Promise<string | null> {
+  try {
+    const raw = await githubApi<{ login: string | null }>(pi, "/user");
+    return raw.login != null && raw.login.length > 0 ? raw.login : null;
+  } catch {
+    return null;
+  }
 }
